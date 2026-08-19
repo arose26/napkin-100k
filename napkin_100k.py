@@ -934,12 +934,29 @@ def cmd_check_net(args):
     net.load_state_dict(ck["state_dict"])
     net.eval()
 
+    # Independent int8 reference: the same arithmetic the emitted C++ performs,
+    # sharing none of its code. The C++ must match THIS (that is the packer being
+    # correct); its drift from fp32 is quantisation, which we measure, not a bug.
+    sd = ck["state_dict"]
+    qw, sc = [], []
+    for k in ("0.weight", "2.weight", "4.weight"):
+        q, s_ = quantize_int8(sd[k].numpy())
+        qw.append(q.astype(np.float32))
+        sc.append(s_)
+    bs = [sd[k].numpy() for k in ("0.bias", "2.bias", "4.bias")]
+
+    def int8_ref(x):
+        h = np.maximum(qw[0] @ x * sc[0] + bs[0], 0.0)
+        h = np.maximum(qw[1] @ h * sc[1] + bs[1], 0.0)
+        return qw[2] @ h * sc[2] + bs[2]
+
     tmp = tempfile.mkdtemp()
     exe = os.path.join(tmp, "bot")
     subprocess.run(["g++", "-O2", "-o", exe, args.cpp], check=True)
 
     rng = random.Random(args.seed)
-    agree = total = 0
+    agree = total = 0            # C++ vs the int8 reference  -> packer correctness
+    agree_fp = 0                 # int8 reference vs fp32     -> quantisation drift
     disagreements = []
     for game in range(args.games):
         bot_seat = game % 2
@@ -965,22 +982,30 @@ def cmd_check_net(args):
                 x = np.asarray(encode_planes(eng, eng.current_player), dtype=np.float32)
                 with torch.no_grad():
                     q = net(torch.from_numpy(x[None])).numpy()[0]
+                qi = int8_ref(x)
                 torch_mv = max(va, key=lambda a: q[action_index(*a)])
+                ref_mv = max(va, key=lambda a: qi[action_index(*a)])
                 total += 1
-                if cpp_mv == torch_mv:
+                if cpp_mv == ref_mv:
                     agree += 1
                 elif len(disagreements) < 5:
-                    gap = abs(q[action_index(*cpp_mv)] - q[action_index(*torch_mv)])
-                    disagreements.append((cpp_mv, torch_mv, gap))
+                    gap = abs(qi[action_index(*cpp_mv)] - qi[action_index(*ref_mv)])
+                    disagreements.append((cpp_mv, ref_mv, gap))
+                if ref_mv == torch_mv:
+                    agree_fp += 1
                 eng.play(*cpp_mv)
         finally:
             proc.kill()
             proc.wait()
     shutil.rmtree(tmp, ignore_errors=True)
     pct = 100.0 * agree / max(1, total)
-    print(f"check-net: {agree}/{total} decisions match torch ({pct:.2f}%)")
+    pct_fp = 100.0 * agree_fp / max(1, total)
+    print(f"check-net: C++ vs int8 reference {agree}/{total} ({pct:.2f}%)  "
+          f"<- packer correctness, gated at {args.min_agree}%")
+    print(f"           int8 vs fp32          {agree_fp}/{total} ({pct_fp:.2f}%)  "
+          f"<- quantisation drift, measured not gated")
     for c, t, g in disagreements:
-        print(f"  cpp {c} vs torch {t}, |dQ| = {g:.5f}")
+        print(f"  cpp {c} vs ref {t}, |dQ| = {g:.5f}")
     return 0 if pct >= args.min_agree else 1
 
 

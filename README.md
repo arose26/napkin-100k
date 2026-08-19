@@ -163,9 +163,16 @@ C++'s 94.59%. So the C++ faithfully implements int8 inference; the disagreements
 inherent to quantisation, and they sit on near-ties (median fp32 Q-gap at a
 disagreement **0.0017**, with 93% of disagreements under 0.01 on a Q scale of ±1).
 The registered threshold of 99.9% was simply the wrong bar for an int8 net — it is the
-right bar for a bit-exact fp32 emitter. The honest correction is to gate the packer
-against an int8 reference (which it passes) and to treat fp32↔int8 argmax drift as a
-*measured quantity* (5.7% of decisions, worth ~0 win rate) rather than a defect.
+right bar for a bit-exact fp32 emitter.
+
+`check-net` was corrected accordingly and now reports two separate things: the packer's
+correctness, gated, and quantisation drift, measured. Re-run against the trained net:
+
+    C++ vs int8 reference   208/208 (100.00%)   <- packer correctness, gated at 99.9%
+    int8 vs fp32            196/208 ( 94.23%)   <- quantisation drift, measured
+
+**The packer is exactly correct**; the 5.8% of decisions that differ from fp32 are
+quantisation, and they cost no measurable strength (H3-2).
 
 **H3-4 — not attempted.** The net has not been submitted to the arena and will not be
 while it loses 0–60 to a baseline. Putting it on the public ladder now would measure
