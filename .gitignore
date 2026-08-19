@@ -1,1 +1,5 @@
 __pycache__/
+# training checkpoints: rewritten every iteration, regenerable from `train`/`train-az`.
+# The reviewable artefact is the PACKED source (out/*.cpp), which is text.
+out/*.pt
+out/*.log
