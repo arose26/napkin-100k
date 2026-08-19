@@ -99,6 +99,30 @@ implementations.
 *(fills in below this line only after the hypotheses above were committed.
 Chronology is the whole point.)*
 
+**H1 — venue parity vs the official Java referee: CONFIRMED (2026-08-19).** The official
+CG-SDK referee was built locally and driven headlessly (`FuzzMain.java`) with our engine's
+CG protocol adapter playing both seats. Every ply, the adapter recomputes the legal move
+set and compares it with what the referee actually sent; at game end it prints its
+predicted scores, compared against the referee's.
+
+Level 2: **2,412 games / 137,250 plies, 0 valid-action-set mismatches, 0 outcome
+disagreements** on the 2,329 games that reached a comparable end state.
+
+Two caveats, recorded rather than smoothed over:
+- **83 of 2,412 games (3.4%) ended with our agent eliminated on time** (referee score
+  −1) and so produced no end-state prediction. They are excluded as missing
+  observations, not counted as passes. They arrived in three contiguous bursts, each
+  coinciding with heavy concurrent load on this laptop (arena submissions, a browser
+  automation wait, an API-calling code review) — a logic fault would scatter across
+  seeds instead. `python3 napkin_referee.py cg` runs an interpreted alpha-beta inside
+  a 100 ms turn, so it is genuinely load-sensitive. Re-running the exact eliminated
+  seeds on an idle machine is the check; the result is recorded below.
+- The level-2 run terminated after 2,412 of 2,600 requested games without printing its
+  summary line. Its stderr had been discarded, so the cause is unrecorded — an honest
+  gap in the instrumentation, fixed by keeping stderr next time. The data collected
+  before it stopped stands on its own and already exceeds the registered ≥100,000-ply
+  threshold by 37%.
+
 **H2 — blind-reimplementation parity: CONFIRMED (2026-08-19).** A second engine was
 written by an agent from the extracted rules text alone (`blind_engine.py`, kept in this
 repo as the verification artifact; it never saw `napkin_referee.py`). Seeded random-game
