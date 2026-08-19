@@ -173,6 +173,42 @@ further. That ceiling is itself informative: a net trained by DQN to pick moves 
 also a good *evaluation function*, which is precisely the gap the AlphaZero loop (H5)
 attacks by training the value head on game outcomes and the policy head on search.
 
+**H5 — the AlphaZero loop: NOT MET at this compute budget, and the search ceiling is
+the more interesting finding.**
+
+The loop is implemented and verified: a policy+value net (324→128→96 trunk, 61,632
+weights) guiding a batched PUCT **tree** search with exact terminal values and no
+hand-written evaluation anywhere. Correctness of the search is asserted in `selfcheck`
+by a test that does not depend on training at all — with an *untrained* net, where the
+value head is pure noise and only terminals carry signal, the search still found
+**111 of 111 forced wins**. A flipped backup sign would make it avoid them.
+
+Trained on one laptop GPU it does not reach competitive strength: after 60 iterations
+(~22 min) it scores 0.07–0.30 against `greedy`, with the value loss *rising* (0.30 →
+0.67) as the buffer fills with targets from many policy generations. AlphaZero is
+compute-hungry and this is a fraction of what it needs. **Registered prediction (1)
+≥ 60% vs `ab` is not met, so gate (3) forbids a submission, and none was made.**
+
+**The search ceiling.** Putting the H3/H4/H5 numbers side by side against the same
+opponent tells a cleaner story than any of them alone:
+
+| player | vs `ab` |
+|---|---|
+| DQN net alone (argmax, no search) | 0.000 |
+| same net + depth-3 negamax (Python, fp32) | 0.506 |
+| same net + iterative-deepening negamax (C++, int8, reaches depth 4) | **0.417** |
+
+Searching *deeper* made it **worse**. That is the signature of a poor evaluation
+function: deeper search amplifies evaluation error instead of averaging it out. The DQN
+net was trained to rank moves for argmax selection, not to score positions, and it shows
+the moment it is asked to be an evaluator. So the ceiling at parity in H4 is not a
+coincidence of depth — it is the quality of the learned evaluation, which is exactly
+what the AlphaZero value head is meant to fix and exactly what more compute would buy.
+
+The packed searching bot is nonetheless a working artefact: **96,689 bytes** including
+weights and search, 3,311 under the cap, reaching depth 4 inside the turn budget and
+scoring 0.917 against `greedy`.
+
 **H3 — the net: 1 FALSIFIED, 2 CONFIRMED, 3 FALSIFIED (threshold was wrong), 4 not
 attempted.** 500 iterations of self-play (≈128,000 games) on one laptop GPU, ~34 minutes.
 

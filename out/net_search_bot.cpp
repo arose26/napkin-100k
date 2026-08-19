@@ -1,11 +1,14 @@
-/* napkin-100k: a self-play-trained net, weights and all, in one file.
+/* napkin-100k: a self-play-trained net, weights and all, in one file,
+ * used as the evaluation function inside a negamax search.
+ * Every learned quantity is the net's; the search adds lookahead and exact
+ * terminal results, and contains no hand-written position evaluation.
  * Disclosed bot - github.com/arose26/napkin-100k, account Napkin100k.
- * Net: 324-128-128-81, int8 weights decoded from base85 below.
- * CG compiles at -O0 by default, hence the pragma. */
+ * Net: 324-128-128-81, int8 weights decoded from base85 below. */
 #pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <string>
 
 static const int N_IN = 324, N_H1 = 128, N_H2 = 128, N_ACT = 81;
@@ -185,10 +188,8 @@ static const char* W85 =
 static const float B1[] = {-0.116672f,-0.804961f,-0.341719f,-0.621448f,-0.477066f,-0.107632f,1.03661f,-0.976981f,-0.555347f,-0.666019f,-0.677577f,-0.125753f,0.693966f,-0.727971f,-0.408073f,0.897553f,-0.713661f,-0.546837f,0.452195f,0.190755f,-0.424153f,-1.05062f,-0.487429f,-0.81349f,0.282385f,0.768405f,-0.78091f,0.215765f,-1.15869f,-0.87337f,-0.562951f,-0.345205f,-0.964852f,-0.668792f,-0.808608f,0.396537f,0.36126f,0.0274531f,-0.387578f,-1.3965f,-0.189404f,-1.31274f,-1.00314f,-0.517796f,-1.38141f,-0.906868f,-0.914043f,-0.96229f,-0.65603f,-1.08048f,-0.825961f,-0.557768f,-0.500305f,-0.618005f,-1.09951f,-1.09374f,0.237754f,-0.498131f,-0.599775f,-0.768115f,-1.24372f,-0.648294f,-0.195254f,-0.512555f,-0.731835f,-1.07918f,-0.666649f,-1.10569f,-0.4911f,-0.968299f,-0.906997f,-0.678039f,-0.575929f,-0.808377f,-0.913118f,-0.950556f,-0.825092f,0.343356f,0.0794351f,-1.13269f,1.45605f,-0.626638f,1.7857f,-0.505042f,-0.621075f,-0.775489f,1.93654f,0.62025f,2.22816f,-0.312599f,-1.04468f,-1.27162f,-1.09363f,-0.482025f,-0.83568f,-0.557205f,0.413359f,-0.401809f,-0.125459f,-0.767601f,-0.353802f,-0.666525f,-0.515543f,-0.774574f,-0.677448f,-0.360533f,-0.650484f,0.624824f,-1.18692f,-1.29118f,-0.759517f,-0.234444f,-0.71057f,0.0699018f,-0.971338f,-0.547867f,-0.257109f,-0.496564f,1.51082f,0.808436f,-0.375529f,-0.704995f,-0.576177f,0.403493f,-0.708207f,0.766291f,-0.590262f,-0.852831f};
 static const float B2[] = {-0.414565f,-0.169903f,-0.395093f,-0.312062f,-0.312967f,-0.255962f,-0.330535f,-0.337805f,-0.239027f,-0.291944f,-0.382071f,-0.51586f,-0.412614f,-0.602359f,-0.346547f,-0.453127f,-0.169508f,-0.415983f,-0.424115f,-0.478833f,-0.408541f,-0.368957f,-0.461739f,-0.301487f,-0.239107f,-0.491414f,-0.155968f,-0.281061f,-0.305188f,-0.142505f,-0.363655f,-0.264149f,-0.364334f,-0.278972f,-0.204438f,-0.387551f,-0.540165f,-0.382495f,0.0683654f,-0.398927f,-0.352885f,-0.506194f,-0.242602f,-0.203099f,-0.528317f,-0.395703f,-0.331554f,-0.392778f,-0.251209f,-0.363296f,-0.333247f,-0.336654f,0.000447953f,-0.546695f,-0.300678f,-0.290216f,-0.393141f,-0.354881f,-0.304162f,-0.352781f,-0.324104f,-0.345612f,-0.224577f,-0.385291f,-0.742439f,-0.408859f,-0.499013f,-0.263185f,-0.328843f,-0.0675577f,-0.441016f,-0.325504f,-0.373879f,-0.452274f,-0.365019f,-0.190306f,-0.546784f,-0.179905f,0.00153738f,-0.268736f,-0.28713f,-0.450828f,-0.337656f,-0.312206f,-0.527349f,-0.466347f,-0.225613f,-0.316657f,-0.436875f,-0.376378f,-0.450752f,-0.371642f,-0.382402f,-0.485202f,-0.343659f,-0.100983f,-0.142698f,-0.275972f,-0.425828f,-0.301722f,-0.458037f,-0.166549f,-0.412476f,-0.553958f,-0.113568f,-0.387721f,-0.393213f,-0.334027f,0.0430324f,-0.514097f,-0.465721f,-0.029196f,-0.361633f,-0.381224f,-0.317376f,-0.414675f,-0.410968f,-0.00162089f,-0.419133f,-0.415127f,-0.261674f,-0.254836f,-0.299016f,-0.374476f,-0.409306f,-0.523033f,-0.221249f,-0.256267f};
 static const float B3[] = {0.0496368f,0.062066f,0.0471308f,0.0391265f,0.0568475f,0.0594974f,0.0367601f,0.00178494f,0.0465629f,0.00329271f,0.0811989f,0.0324187f,0.0501961f,0.0116804f,0.0547546f,0.0496563f,-0.000409909f,0.0528961f,0.0334734f,0.0732453f,0.0198759f,0.0372914f,0.0310305f,0.0330709f,0.0496933f,0.0300791f,0.0565692f,0.0123193f,0.0383711f,0.0485183f,0.143016f,0.108425f,0.143206f,0.0376909f,0.00151502f,0.0202944f,0.0143687f,0.00736076f,0.0529018f,0.0304309f,0.0942071f,0.116792f,0.0333898f,-0.0260228f,0.0221555f,0.0201799f,-0.00919829f,0.046853f,0.0963489f,0.0806283f,0.103022f,0.0599971f,0.0304729f,0.0476781f,0.0722375f,0.066951f,0.0710249f,0.0187835f,0.0127953f,0.066574f,0.0544999f,0.0326178f,0.0849378f,0.0316945f,0.00739509f,-0.0211212f,0.0536325f,0.0285251f,0.058673f,0.0926338f,0.0976506f,0.0976123f,0.0368461f,0.0319558f,0.0238975f,0.0434771f,0.0120953f,0.0601855f,0.0819126f,0.0551273f,0.0625876f};
-
 static int8_t W[68224];
 
-/* base85 (RFC1924 alphabet, 5 chars -> 4 bytes), matching the Python emitter */
 static void decodeWeights() {
     static const char* A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                            "abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
@@ -198,83 +199,145 @@ static void decodeWeights() {
     for (size_t i = 0; i + 4 < n; i += 5) {
         uint32_t v = 0;
         for (int k = 0; k < 5; k++) v = v * 85u + (uint32_t)inv[(unsigned char)W85[i+k]];
-        for (int k = 3; k >= 0; k--) {
+        for (int k = 3; k >= 0; k--)
             if (out + (size_t)k < (size_t)68224) W[out + k] = (int8_t)((v >> (8 * (3 - k))) & 0xFF);
-        }
         out += 4;
     }
 }
 
-static float h1[N_H1], h2[N_H2], qout[N_ACT];
-
+static float h1_[N_H1], h2_[N_H2], qout[N_ACT];
 static void forward(const float* x) {
     const int8_t* w = W;
     for (int j = 0; j < N_H1; j++) {
         float a = 0.f;
         for (int i = 0; i < N_IN; i++) a += x[i] * (float)w[j * N_IN + i];
-        a = a * S1 + B1[j];
-        h1[j] = a > 0.f ? a : 0.f;
+        a = a * S1 + B1[j]; h1_[j] = a > 0.f ? a : 0.f;
     }
     w += N_IN * N_H1;
     for (int j = 0; j < N_H2; j++) {
         float a = 0.f;
-        for (int i = 0; i < N_H1; i++) a += h1[i] * (float)w[j * N_H1 + i];
-        a = a * S2 + B2[j];
-        h2[j] = a > 0.f ? a : 0.f;
+        for (int i = 0; i < N_H1; i++) a += h1_[i] * (float)w[j * N_H1 + i];
+        a = a * S2 + B2[j]; h2_[j] = a > 0.f ? a : 0.f;
     }
     w += N_H1 * N_H2;
     for (int j = 0; j < N_ACT; j++) {
         float a = 0.f;
-        for (int i = 0; i < N_H2; i++) a += h2[i] * (float)w[j * N_H2 + i];
+        for (int i = 0; i < N_H2; i++) a += h2_[i] * (float)w[j * N_H2 + i];
         qout[j] = a * S3 + B3[j];
     }
 }
 
-/* ---- game state, mirroring the verified Python engine's encoder ---- */
+/* ---- game (mirrors the verified Python engine) ---- */
 static const uint16_t WINM[8] = {0700,070,07,0444,0222,0111,0421,0124};
-static bool winsMask(uint16_t m){for(int i=0;i<8;i++) if((m&WINM[i])==WINM[i]) return true; return false;}
-static uint16_t bd[2][9]; static uint16_t owned[2]; static uint16_t drawnM;
+static bool winsM(uint16_t m){for(int i=0;i<8;i++) if((m&WINM[i])==WINM[i]) return true; return false;}
+struct Pos { uint16_t b[2][9], own[2], drawn; int last, side, cnt[2]; };
+struct Undo { uint16_t o0,o1,dr; int last,c0,c1; };
 
-static void applyMove(int r,int c,int p){
-    int b=(r/3)*3+c/3, i=(r%3)*3+(c%3);
-    bd[p][b]|=(uint16_t)(1<<i);
-    if(winsMask(bd[p][b])) owned[p]|=(uint16_t)(1<<b);
-    else if((bd[0][b]|bd[1][b])==0777) drawnM|=(uint16_t)(1<<b);
+static inline bool decided(const Pos& p,int b){return ((p.own[0]|p.own[1]|p.drawn)>>b)&1;}
+static int legal(const Pos& p,int* out){
+    int n=0, ab=-1;
+    if(p.last>=0){ int t=((p.last/9)%3)*3+(p.last%9)%3; if(!decided(p,t)) ab=t; }
+    for(int b=0;b<9;b++){
+        if(ab>=0&&b!=ab) continue;
+        if(decided(p,b)) continue;
+        uint16_t occ=(uint16_t)(p.b[0][b]|p.b[1][b]);
+        int br=(b/3)*3, bc=(b%3)*3;
+        for(int i=0;i<9;i++) if(!((occ>>i)&1)) out[n++]=(br+i/3)*9+bc+i%3;
+    }
+    return n;
+}
+static inline bool mk(Pos& p,int cell,Undo& u){
+    u.o0=p.own[0];u.o1=p.own[1];u.dr=p.drawn;u.last=p.last;u.c0=p.cnt[0];u.c1=p.cnt[1];
+    int r=cell/9,c=cell%9,b=(r/3)*3+c/3,i=(r%3)*3+(c%3),s=p.side;
+    p.b[s][b]|=(uint16_t)(1<<i);
+    bool mw=false;
+    if(winsM(p.b[s][b])){p.own[s]|=(uint16_t)(1<<b);p.cnt[s]++;if(winsM(p.own[s]))mw=true;}
+    else if((p.b[0][b]|p.b[1][b])==0777) p.drawn|=(uint16_t)(1<<b);
+    p.last=cell;p.side=1-s;return mw;
+}
+static inline void unmk(Pos& p,int cell,const Undo& u){
+    int r=cell/9,c=cell%9,b=(r/3)*3+c/3,i=(r%3)*3+(c%3);
+    p.side=1-p.side;p.b[p.side][b]&=(uint16_t)~(1<<i);
+    p.own[0]=u.o0;p.own[1]=u.o1;p.drawn=u.dr;p.last=u.last;p.cnt[0]=u.c0;p.cnt[1]=u.c1;
 }
 
-/* encode_planes(): [mine | theirs | legal | owned_diff], 4 x 81 */
+/* encode_planes(): [mine | theirs | legal | owned_diff] for the side to move */
 static float feat[4*81];
-static void encode(int me,const int* legalCells,int nLegal){
+static void encode(const Pos& p,const int* mv,int n){
     memset(feat,0,sizeof(feat));
-    int opp=1-me;
+    int me=p.side, opp=1-me;
     for(int r=0;r<9;r++)for(int c=0;c<9;c++){
-        int b=(r/3)*3+c/3, i=(r%3)*3+(c%3), idx=r*9+c;
-        feat[idx]        = (float)((bd[me][b]>>i)&1);
-        feat[81+idx]     = (float)((bd[opp][b]>>i)&1);
-        feat[243+idx]    = (float)(((owned[me]>>b)&1) - ((owned[opp]>>b)&1));
+        int b=(r/3)*3+c/3,i=(r%3)*3+(c%3),idx=r*9+c;
+        feat[idx]=(float)((p.b[me][b]>>i)&1);
+        feat[81+idx]=(float)((p.b[opp][b]>>i)&1);
+        feat[243+idx]=(float)(((p.own[me]>>b)&1)-((p.own[opp]>>b)&1));
     }
-    for(int k=0;k<nLegal;k++) feat[162+legalCells[k]] = 1.f;
+    for(int k=0;k<n;k++) feat[162+mv[k]]=1.f;
+}
+
+/* leaf value from the side-to-move's view: the net's own best Q here */
+static float leafValue(const Pos& p,const int* mv,int n){
+    encode(p,mv,n); forward(feat);
+    float best=-1e30f;
+    for(int k=0;k<n;k++) if(qout[mv[k]]>best) best=qout[mv[k]];
+    if(best>1.f) best=1.f; if(best<-1.f) best=-1.f;
+    return best;
+}
+
+static std::chrono::steady_clock::time_point deadline;
+static bool timeUp=false; static long evals=0;
+static inline bool tick(){ if((++evals&63)==0 && std::chrono::steady_clock::now()>deadline) timeUp=true; return timeUp; }
+
+static float negamax(Pos& p,int depth,float alpha,float beta){
+    int mv[81]; int n=legal(p,mv);
+    if(n==0){ int d=p.cnt[p.side]-p.cnt[1-p.side]; return d>0?1.f:(d<0?-1.f:0.f); }
+    if(depth==0||tick()) return leafValue(p,mv,n);
+    float best=-2.f;
+    for(int k=0;k<n;k++){
+        Undo u; bool mw=mk(p,mv[k],u);
+        float v = mw ? 1.f : -negamax(p,depth-1,-beta,-alpha);
+        unmk(p,mv[k],u);
+        if(v>best) best=v;
+        if(best>alpha) alpha=best;
+        if(alpha>=beta) break;
+        if(timeUp) break;
+    }
+    return best;
 }
 
 int main(){
     decodeWeights();
-    int me=-1;
+    Pos p; memset(&p,0,sizeof(p)); p.last=-1; p.side=0;
+    bool first=true; int me=-1;
     while(true){
         int orow,ocol;
         if(scanf("%d%d",&orow,&ocol)!=2) return 0;
         if(orow<-1||orow>8||ocol<-1||ocol>8) return 1;
-        if(me<0) me = (orow==-1)?0:1;
-        if(orow>=0&&ocol>=0) applyMove(orow,ocol,1-me);
+        if(me<0) me=(orow==-1)?0:1;
+        if(orow>=0&&ocol>=0){ Undo u; mk(p,orow*9+ocol,u); }
         int n; if(scanf("%d",&n)!=1||n<1||n>81) return 1;
-        int cells[81];
+        int mv[81];
         for(int i=0;i<n;i++){int r,c; if(scanf("%d%d",&r,&c)!=2) return 1;
-            if(r<0||r>8||c<0||c>8) return 1; cells[i]=r*9+c;}
-        encode(me,cells,n);
-        forward(feat);
-        int best=cells[0]; float bv=-1e30f;
-        for(int i=0;i<n;i++){ if(qout[cells[i]]>bv){bv=qout[cells[i]];best=cells[i];} }
-        applyMove(best/9,best%9,me);
-        printf("%d %d\n",best/9,best%9);
-        fflush(stdout);
+            if(r<0||r>8||c<0||c>8) return 1; mv[i]=r*9+c;}
+        int budget = first ? 900 : 85; first=false;
+        deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(budget);
+        timeUp=false; evals=0;
+        int best=mv[0], reached=0;
+        for(int depth=1; depth<=12; depth++){
+            float bv=-2.f; int bm=mv[0];
+            for(int k=0;k<n;k++){
+                Undo u; bool mw=mk(p,mv[k],u);
+                float v = mw ? 1.f : -negamax(p,depth-1,-2.f,2.f);
+                unmk(p,mv[k],u);
+                if(timeUp) break;
+                if(v>bv){bv=v;bm=mv[k];}
+            }
+            if(timeUp) break;
+            best=bm; reached=depth;
+            if(bv>=1.f) break;
+        }
+        fprintf(stderr,"depth=%d evals=%ld\n",reached,evals);
+        Undo u; mk(p,best,u);
+        printf("%d %d\n",best/9,best%9); fflush(stdout);
     }
 }

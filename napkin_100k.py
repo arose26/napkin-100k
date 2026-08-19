@@ -1177,6 +1177,182 @@ int main(){
 }
 """
 
+NET_SEARCH_CPP_TEMPLATE = r"""/* napkin-100k: a self-play-trained net, weights and all, in one file,
+ * used as the evaluation function inside a negamax search.
+ * Every learned quantity is the net's; the search adds lookahead and exact
+ * terminal results, and contains no hand-written position evaluation.
+ * Disclosed bot - github.com/arose26/napkin-100k, account Napkin100k.
+ * Net: %(shape)s, int8 weights decoded from base85 below. */
+#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <chrono>
+#include <string>
+
+static const int N_IN = %(n_in)d, N_H1 = %(n_h1)d, N_H2 = %(n_h2)d, N_ACT = %(n_act)d;
+static const float S1 = %(s1).9gf, S2 = %(s2).9gf, S3 = %(s3).9gf;
+static const char* W85 =
+%(w85)s;
+static const float B1[] = {%(b1)s};
+static const float B2[] = {%(b2)s};
+static const float B3[] = {%(b3)s};
+static int8_t W[%(nw)d];
+
+static void decodeWeights() {
+    static const char* A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                           "abcdefghijklmnopqrstuvwxyz!#$%%&()*+-;<=>?@^_`{|}~";
+    int inv[256]; for (int i = 0; i < 256; i++) inv[i] = -1;
+    for (int i = 0; i < 85; i++) inv[(unsigned char)A[i]] = i;
+    size_t n = strlen(W85); size_t out = 0;
+    for (size_t i = 0; i + 4 < n; i += 5) {
+        uint32_t v = 0;
+        for (int k = 0; k < 5; k++) v = v * 85u + (uint32_t)inv[(unsigned char)W85[i+k]];
+        for (int k = 3; k >= 0; k--)
+            if (out + (size_t)k < (size_t)%(nw)d) W[out + k] = (int8_t)((v >> (8 * (3 - k))) & 0xFF);
+        out += 4;
+    }
+}
+
+static float h1_[N_H1], h2_[N_H2], qout[N_ACT];
+static void forward(const float* x) {
+    const int8_t* w = W;
+    for (int j = 0; j < N_H1; j++) {
+        float a = 0.f;
+        for (int i = 0; i < N_IN; i++) a += x[i] * (float)w[j * N_IN + i];
+        a = a * S1 + B1[j]; h1_[j] = a > 0.f ? a : 0.f;
+    }
+    w += N_IN * N_H1;
+    for (int j = 0; j < N_H2; j++) {
+        float a = 0.f;
+        for (int i = 0; i < N_H1; i++) a += h1_[i] * (float)w[j * N_H1 + i];
+        a = a * S2 + B2[j]; h2_[j] = a > 0.f ? a : 0.f;
+    }
+    w += N_H1 * N_H2;
+    for (int j = 0; j < N_ACT; j++) {
+        float a = 0.f;
+        for (int i = 0; i < N_H2; i++) a += h2_[i] * (float)w[j * N_H2 + i];
+        qout[j] = a * S3 + B3[j];
+    }
+}
+
+/* ---- game (mirrors the verified Python engine) ---- */
+static const uint16_t WINM[8] = {0700,070,07,0444,0222,0111,0421,0124};
+static bool winsM(uint16_t m){for(int i=0;i<8;i++) if((m&WINM[i])==WINM[i]) return true; return false;}
+struct Pos { uint16_t b[2][9], own[2], drawn; int last, side, cnt[2]; };
+struct Undo { uint16_t o0,o1,dr; int last,c0,c1; };
+
+static inline bool decided(const Pos& p,int b){return ((p.own[0]|p.own[1]|p.drawn)>>b)&1;}
+static int legal(const Pos& p,int* out){
+    int n=0, ab=-1;
+    if(p.last>=0){ int t=((p.last/9)%%3)*3+(p.last%%9)%%3; if(!decided(p,t)) ab=t; }
+    for(int b=0;b<9;b++){
+        if(ab>=0&&b!=ab) continue;
+        if(decided(p,b)) continue;
+        uint16_t occ=(uint16_t)(p.b[0][b]|p.b[1][b]);
+        int br=(b/3)*3, bc=(b%%3)*3;
+        for(int i=0;i<9;i++) if(!((occ>>i)&1)) out[n++]=(br+i/3)*9+bc+i%%3;
+    }
+    return n;
+}
+static inline bool mk(Pos& p,int cell,Undo& u){
+    u.o0=p.own[0];u.o1=p.own[1];u.dr=p.drawn;u.last=p.last;u.c0=p.cnt[0];u.c1=p.cnt[1];
+    int r=cell/9,c=cell%%9,b=(r/3)*3+c/3,i=(r%%3)*3+(c%%3),s=p.side;
+    p.b[s][b]|=(uint16_t)(1<<i);
+    bool mw=false;
+    if(winsM(p.b[s][b])){p.own[s]|=(uint16_t)(1<<b);p.cnt[s]++;if(winsM(p.own[s]))mw=true;}
+    else if((p.b[0][b]|p.b[1][b])==0777) p.drawn|=(uint16_t)(1<<b);
+    p.last=cell;p.side=1-s;return mw;
+}
+static inline void unmk(Pos& p,int cell,const Undo& u){
+    int r=cell/9,c=cell%%9,b=(r/3)*3+c/3,i=(r%%3)*3+(c%%3);
+    p.side=1-p.side;p.b[p.side][b]&=(uint16_t)~(1<<i);
+    p.own[0]=u.o0;p.own[1]=u.o1;p.drawn=u.dr;p.last=u.last;p.cnt[0]=u.c0;p.cnt[1]=u.c1;
+}
+
+/* encode_planes(): [mine | theirs | legal | owned_diff] for the side to move */
+static float feat[4*81];
+static void encode(const Pos& p,const int* mv,int n){
+    memset(feat,0,sizeof(feat));
+    int me=p.side, opp=1-me;
+    for(int r=0;r<9;r++)for(int c=0;c<9;c++){
+        int b=(r/3)*3+c/3,i=(r%%3)*3+(c%%3),idx=r*9+c;
+        feat[idx]=(float)((p.b[me][b]>>i)&1);
+        feat[81+idx]=(float)((p.b[opp][b]>>i)&1);
+        feat[243+idx]=(float)(((p.own[me]>>b)&1)-((p.own[opp]>>b)&1));
+    }
+    for(int k=0;k<n;k++) feat[162+mv[k]]=1.f;
+}
+
+/* leaf value from the side-to-move's view: the net's own best Q here */
+static float leafValue(const Pos& p,const int* mv,int n){
+    encode(p,mv,n); forward(feat);
+    float best=-1e30f;
+    for(int k=0;k<n;k++) if(qout[mv[k]]>best) best=qout[mv[k]];
+    if(best>1.f) best=1.f; if(best<-1.f) best=-1.f;
+    return best;
+}
+
+static std::chrono::steady_clock::time_point deadline;
+static bool timeUp=false; static long evals=0;
+static inline bool tick(){ if((++evals&63)==0 && std::chrono::steady_clock::now()>deadline) timeUp=true; return timeUp; }
+
+static float negamax(Pos& p,int depth,float alpha,float beta){
+    int mv[81]; int n=legal(p,mv);
+    if(n==0){ int d=p.cnt[p.side]-p.cnt[1-p.side]; return d>0?1.f:(d<0?-1.f:0.f); }
+    if(depth==0||tick()) return leafValue(p,mv,n);
+    float best=-2.f;
+    for(int k=0;k<n;k++){
+        Undo u; bool mw=mk(p,mv[k],u);
+        float v = mw ? 1.f : -negamax(p,depth-1,-beta,-alpha);
+        unmk(p,mv[k],u);
+        if(v>best) best=v;
+        if(best>alpha) alpha=best;
+        if(alpha>=beta) break;
+        if(timeUp) break;
+    }
+    return best;
+}
+
+int main(){
+    decodeWeights();
+    Pos p; memset(&p,0,sizeof(p)); p.last=-1; p.side=0;
+    bool first=true; int me=-1;
+    while(true){
+        int orow,ocol;
+        if(scanf("%%d%%d",&orow,&ocol)!=2) return 0;
+        if(orow<-1||orow>8||ocol<-1||ocol>8) return 1;
+        if(me<0) me=(orow==-1)?0:1;
+        if(orow>=0&&ocol>=0){ Undo u; mk(p,orow*9+ocol,u); }
+        int n; if(scanf("%%d",&n)!=1||n<1||n>81) return 1;
+        int mv[81];
+        for(int i=0;i<n;i++){int r,c; if(scanf("%%d%%d",&r,&c)!=2) return 1;
+            if(r<0||r>8||c<0||c>8) return 1; mv[i]=r*9+c;}
+        int budget = first ? 900 : 85; first=false;
+        deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(budget);
+        timeUp=false; evals=0;
+        int best=mv[0], reached=0;
+        for(int depth=1; depth<=12; depth++){
+            float bv=-2.f; int bm=mv[0];
+            for(int k=0;k<n;k++){
+                Undo u; bool mw=mk(p,mv[k],u);
+                float v = mw ? 1.f : -negamax(p,depth-1,-2.f,2.f);
+                unmk(p,mv[k],u);
+                if(timeUp) break;
+                if(v>bv){bv=v;bm=mv[k];}
+            }
+            if(timeUp) break;
+            best=bm; reached=depth;
+            if(bv>=1.f) break;
+        }
+        fprintf(stderr,"depth=%%d evals=%%ld\n",reached,evals);
+        Undo u; mk(p,best,u);
+        printf("%%d %%d\n",best/9,best%%9); fflush(stdout);
+    }
+}
+"""
+
+
 B85_ALPHABET = ("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                 "abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~")
 
@@ -1234,10 +1410,13 @@ def cmd_pack(args):
     blob = q1.tobytes() + q2.tobytes() + q3.tobytes()
     txt = b85_encode(blob)
     # split into C string literal chunks so the line length stays sane
-    chunks = [txt[i:i + 100] for i in range(0, len(txt), 100)]
+    # Longer literals mean fewer quote+newline bytes: at 100 chars/line the
+    # wrapping alone cost ~4.3KB of the budget, at 500 it costs ~0.9KB.
+    chunks = [txt[i:i + 500] for i in range(0, len(txt), 500)]
     w85 = "\n".join(f'  "{c}"' for c in chunks)
     fmt = lambda a: ",".join(f"{float(v):.6g}f" for v in a)
-    src = NET_CPP_TEMPLATE % {
+    template = NET_SEARCH_CPP_TEMPLATE if args.search else NET_CPP_TEMPLATE
+    src = template % {
         "shape": f"{n_in}-{n_h1}-{n_h2}-{n_act}",
         "n_in": n_in, "n_h1": n_h1, "n_h2": n_h2, "n_act": n_act,
         "s1": s1, "s2": s2, "s3": s3, "w85": w85, "nw": len(blob),
@@ -1669,6 +1848,8 @@ def main():
     pk = sub.add_parser("pack")
     pk.add_argument("--net", default="out/net.pt")
     pk.add_argument("--out", default="out/net_bot.cpp")
+    pk.add_argument("--search", action="store_true",
+                    help="emit the net inside a negamax search")
     ta = sub.add_parser("train-az")
     ta.add_argument("--iters", type=int, default=60)
     ta.add_argument("--sims", type=int, default=48)
