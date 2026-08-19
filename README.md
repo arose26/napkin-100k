@@ -205,7 +205,30 @@ predictions, in ladder score and global rank:
 2. `greedy` lands in the **bottom half of Bronze** (global rank worse than 5,600).
 3. `ab-id` **promotes to Silver** (i.e. beats the Bronze boss) within one submission.
 
-Measured so far: `random` — global **5,101/10,070**, score 19.76, Bronze.
-(The probe bot, which is roughly greedy-plus-a-perfect-3×3-opening, scored 30.35 at
-global 3,005 — informative context, but it is not one of the three registered baselines
-and is not used as one.)
+**H4′ results (2026-08-19), one submission each, each left to settle:**
+
+| baseline | ladder score | global rank | league | vs prediction |
+|---|---|---|---|---|
+| `random` | 19.76 | 5,101 / 10,070 | Bronze | — |
+| `greedy` (1-ply) | 29.07 | 3,005 / 10,070 | Bronze (rank 1 of 5,666) | **FALSIFIED** — predicted bottom half of Bronze (worse than 5,600); landed at the top |
+| `ab-id` (iterative-deepening α-β, 60 ms, Python) | 37.92 → 31.0 after promotion | **1,804 / 10,070** | **Silver** | **CONFIRMED** — promoted out of Bronze on one submission |
+
+1. **Ordering — confirmed on score, but the rank instrument saturates.** Scores order
+   strictly (19.76 < 29.07 < 37.92). Global *rank* does not: greedy and ab-id both read
+   3,005 because rank is dominated by league membership, and both sat at the top of
+   Bronze. Lesson for the campaign: inside a league, ladder score is the finer
+   instrument; global rank only moves on promotion.
+2. **Falsified.** Greedy is far stronger on this ladder than registered — a 1-ply
+   "win the small board if you can" rule reached rank 1 of Bronze's 5,666 bots. Bronze
+   is much softer than assumed. The registered prediction was simply wrong, and the
+   direction of the error matters for repo 2: the interesting competition starts at
+   Silver, not Bronze.
+3. **Confirmed.** ab-id promoted to Silver on a single submission, where it currently
+   sits at global 1,804 (score rescales on entering a new league, hence 37.92 → ~31).
+
+The probe bot (roughly greedy plus a perfect 3×3 opening) scored 30.35 at global 3,005 —
+context, not a registered baseline.
+
+**Calibration handed to napkin-selfplay:** a trained net must beat **global ~1,804**
+to be worth reporting at all, since a ~60-line alpha-beta with a naive eval already gets
+there. Silver→Gold is the first rung that costs something.
