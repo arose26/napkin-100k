@@ -25,7 +25,8 @@ public class FuzzMain {
         int games = Integer.parseInt(args[0]);
         int level = Integer.parseInt(args[1]);
         long seed0 = Long.parseLong(args[2]);
-        String py = "/home/bob/napkin-referee/napkin_referee.py";
+        String py = System.getenv().getOrDefault("NAPKIN_REFEREE_PY",
+                System.getProperty("user.dir") + "/napkin_referee.py");
         // optional custom agent commands (args 3/4); "SEED" is replaced per game
         String agent0 = args.length > 3 ? args[3]
                 : "python3 " + py + " cg --policy random --level " + level + " --seed SEED0";

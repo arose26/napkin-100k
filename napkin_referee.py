@@ -426,6 +426,8 @@ def cmd_cg(args):
             except ValueError:
                 print(f"PARITY: referee move ({opp_row} {opp_col}) invalid in replica",
                       file=sys.stderr)
+        if eng.game_over:
+            return 0  # referee shouldn't keep talking; don't play on a dead game
         n = int(input())
         ref_va = set()
         for _ in range(n):
@@ -570,13 +572,15 @@ int main() {
     while (1) {
         int orow, ocol;
         if (scanf("%d%d", &orow, &ocol) != 2) return 0;
-        if (orow >= 0) grid[orow][ocol] = 2;
+        if (orow < -1 || orow > 8 || ocol < -1 || ocol > 8) return 1; // never trust stdin
+        if (orow >= 0 && ocol >= 0) grid[orow][ocol] = 2;
         if (orow > 2 || ocol > 2) level1 = false;
-        int n; scanf("%d", &n);
+        int n; if (scanf("%d", &n) != 1 || n < 1 || n > 81) return 1;
         if (n > 9) level1 = false;
         std::vector<std::pair<int,int>> va(n);
         for (int i = 0; i < n; i++) {
-            scanf("%d%d", &va[i].first, &va[i].second);
+            if (scanf("%d%d", &va[i].first, &va[i].second) != 2) return 1;
+            if (va[i].first < 0 || va[i].first > 8 || va[i].second < 0 || va[i].second > 8) return 1;
             if (va[i].first > 2 || va[i].second > 2) level1 = false;
         }
         if (first) { run_probe(); first = false; }
@@ -615,6 +619,25 @@ int main() {
 '''
 
 
+def cmd_emit(args):
+    """Print a standalone CodinGame Python bot: this file plus a bootstrap that
+    runs the chosen policy over the CG protocol. (A file that writes a file.)"""
+    with open(__file__, encoding="utf-8") as f:
+        src = f.read()
+    src = src.replace('if __name__ == "__main__":\n    main()\n', "")
+    src += (
+        "\n# ---- CodinGame entry point (emitted by `napkin_referee.py emit`) ----\n"
+        "# Disclosed bot for the napkin-100k series (github.com/arose26).\n"
+        "import argparse as _ap\n"
+        f"cmd_cg(_ap.Namespace(policy={args.policy!r}, level={args.level}, "
+        f"seed={args.seed}, budget_ms={args.budget_ms}))\n"
+    )
+    sys.stdout.write(src)
+    print(f"emitted {args.policy}: {len(src.encode('utf-8'))} UTF-8 bytes "
+          f"(cap 100000)", file=sys.stderr)
+    return 0
+
+
 def cmd_probe(args):
     src = PROBE_CPP
     if args.utf16_blob:
@@ -626,6 +649,49 @@ def cmd_probe(args):
     units = len(src.encode("utf-16-le")) // 2
     print(f"probe source: {len(src.encode('utf-8'))} UTF-8 bytes, "
           f"{units} UTF-16 units", file=sys.stderr)
+    return 0
+
+
+# -- ladder snapshot (platform-evidence habit, carried from series 2) ----------
+
+CG_LB = "https://www.codingame.com/services/Leaderboards/getFilteredPuzzleLeaderboard"
+CG_HANDLE = "22639068dad6ecdf6717bb383d739a954432057"  # Napkin100k, public
+
+
+def cmd_snapshot(args):
+    """Append one ladder snapshot (our rank + league sizes + top 5) to a JSONL.
+    Unauthenticated and read-only; keep the cadence polite (daily)."""
+    import datetime
+    import json
+    import urllib.request
+
+    def post(body):
+        req = urllib.request.Request(CG_LB, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(req, timeout=20))
+
+    mine = post([args.arena, CG_HANDLE, "global",
+                 {"active": True, "column": "KEYWORD", "filter": args.pseudo}])
+    top = post([args.arena, "", "global",
+                {"active": False, "column": "", "filter": ""}])
+    me = (mine.get("users") or [None])[0]
+    snap = {
+        "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "arena": args.arena,
+        "total_bots": mine.get("count"),
+        "leagues": {k: v.get("divisionAgentsCount")
+                    for k, v in (top.get("leagues") or {}).items()},
+        "me": None if not me else {
+            "pseudo": me.get("pseudo"), "global_rank": me.get("rank"),
+            "score": me.get("score"),
+            "league_index": (me.get("league") or {}).get("divisionIndex")},
+        "top5": [{"rank": u["rank"], "pseudo": u["pseudo"], "score": u.get("score"),
+                  "league_index": (u.get("league") or {}).get("divisionIndex")}
+                 for u in (top.get("users") or [])[:5]],
+    }
+    with open(args.out, "a") as f:
+        f.write(json.dumps(snap) + "\n")
+    print(json.dumps(snap))
     return 0
 
 
@@ -696,6 +762,11 @@ def cmd_selfcheck(args):
     assert sum(pl[162:243]) == 8  # 8 legal replies in the center board
     assert action_index(*index_action(80)) == 80
 
+    # Probe emitter: the two things that silently break it are a missing
+    # optimize pragma (CG compiles -O0) and miscounted source size.
+    assert '#pragma GCC optimize' in PROBE_CPP
+    assert len(PROBE_CPP.encode("utf-8")) < 100000  # the venue's real cap (measured)
+
     print("selfcheck OK")
     return 0
 
@@ -725,9 +796,22 @@ def main():
     c.add_argument("--budget-ms", type=int, default=90)
     p = sub.add_parser("probe")
     p.add_argument("--utf16-blob", action="store_true")
+    e = sub.add_parser("emit")
+    e.add_argument("--policy", required=True, choices=POLICIES)
+    e.add_argument("--level", type=int, default=2, choices=(1, 2))
+    e.add_argument("--seed", type=int, default=0)
+    e.add_argument("--budget-ms", type=int, default=85)
+    s = sub.add_parser("snapshot")
+    s.add_argument("--arena", default="tic-tac-toe")
+    s.add_argument("--pseudo", default="Napkin100k")
+    s.add_argument("--out", default="out/ladder_snapshots.jsonl")
     args = ap.parse_args()
     if args.cmd == "probe":
         sys.exit(cmd_probe(args))
+    if args.cmd == "snapshot":
+        sys.exit(cmd_snapshot(args))
+    if args.cmd == "emit":
+        sys.exit(cmd_emit(args))
     if args.cmd == "selfcheck":
         sys.exit(cmd_selfcheck(args))
     if args.cmd == "bench":
