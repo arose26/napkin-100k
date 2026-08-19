@@ -1408,6 +1408,85 @@ def cmd_check_net(args):
     return 0 if pct >= args.min_agree else 1
 
 
+def cmd_bench_net(args):
+    """Net vs a scripted baseline, both seats, with a Wilson interval.
+
+    --net uses the torch checkpoint; --cpp uses the packed C++ bot instead, which
+    is what actually gets submitted. Comparing the two answers H8-2 (how much
+    strength int8 costs) without any hand-waving."""
+    import shutil
+    import subprocess
+    import tempfile
+    import os
+
+    proc = None
+    tmp = None
+    if args.cpp:
+        tmp = tempfile.mkdtemp()
+        exe = os.path.join(tmp, "bot")
+        subprocess.run(["g++", "-O2", "-o", exe, args.cpp], check=True)
+        net_move = None
+    else:
+        import torch
+        ck = torch.load(args.net, map_location=args.device)
+        net = build_net(args.device)
+        net.load_state_dict(ck["state_dict"])
+        net.eval()
+        net_move = make_net_policy(net, args.device)
+
+    rng = random.Random(args.seed)
+    w = l = d = 0
+    for g in range(args.games):
+        seat = g % 2
+        eng = Engine(2)
+        opp = POLICIES[args.vs](seed=rng.randrange(2**30), budget_ms=args.budget_ms)
+        if args.cpp:
+            proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        try:
+            while not eng.game_over:
+                if eng.current_player == seat:
+                    if args.cpp:
+                        va = sorted(eng.valid_actions())
+                        last = eng.last if eng.last is not None else (-1, -1)
+                        proc.stdin.write(f"{last[0]} {last[1]}\n{len(va)}\n")
+                        for a in va:
+                            proc.stdin.write(f"{a[0]} {a[1]}\n")
+                        proc.stdin.flush()
+                        line = proc.stdout.readline()
+                        if not line:
+                            raise AssertionError("packed bot died")
+                        mv = tuple(int(v) for v in line.split())
+                    else:
+                        mv = net_move(eng)
+                    assert mv in eng.valid_actions(), f"net played illegal {mv}"
+                    eng.play(*mv)
+                else:
+                    eng.play(*opp.act(eng))
+        finally:
+            if proc:
+                proc.kill()
+                proc.wait()
+        if eng.winner == seat:
+            w += 1
+        elif eng.winner == -1:
+            d += 1
+        else:
+            l += 1
+    if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+    n = w + l + d
+    p_hat = (w + 0.5 * d) / n
+    z = 1.96
+    den = 1 + z * z / n
+    mid = (p_hat + z * z / (2 * n)) / den
+    half = z * ((p_hat * (1 - p_hat) / n + z * z / (4 * n * n)) ** 0.5) / den
+    who = args.cpp or args.net
+    print(f"{who} vs {args.vs}: {w}W-{l}L-{d}D of {n} | score {p_hat:.3f} "
+          f"[{mid-half:.3f}, {mid+half:.3f}] (95% Wilson)")
+    return 0
+
+
 # -- ladder snapshot (platform-evidence habit, carried from series 2) ----------
 
 CG_LB = "https://www.codingame.com/services/Leaderboards/getFilteredPuzzleLeaderboard"
@@ -1546,10 +1625,12 @@ def cmd_selfcheck(args):
             return _t.zeros((t.shape[0], N_ACT))
         def __enter__(self): return self
     try:
-        import torch  # noqa: F401
-        import numpy  # noqa: F401
-    except Exception:
-        print("selfcheck OK (torch absent: RL asserts skipped)")
+        import torch
+        import numpy
+        # importing is not enough: this build needs a working numpy bridge
+        torch.from_numpy(numpy.zeros(1, dtype=numpy.float32))
+    except Exception as exc:
+        print(f"selfcheck OK (RL asserts skipped: {type(exc).__name__})")
         return 0
     trs, _ = selfplay_episodes(_FixedNet(), "cpu", 4, 1.0, 11)
     assert trs, "no transitions produced"
@@ -1592,6 +1673,14 @@ def main():
     c.add_argument("--budget-ms", type=int, default=90)
     p = sub.add_parser("probe")
     p.add_argument("--utf16-blob", action="store_true")
+    bn = sub.add_parser("bench-net")
+    bn.add_argument("--net", default="out/net.pt")
+    bn.add_argument("--cpp", default=None)
+    bn.add_argument("--vs", default="greedy", choices=POLICIES)
+    bn.add_argument("--games", type=int, default=100)
+    bn.add_argument("--budget-ms", type=int, default=40)
+    bn.add_argument("--device", default="cpu")
+    bn.add_argument("--seed", type=int, default=7)
     cn = sub.add_parser("check-net")
     cn.add_argument("--net", default="out/net.pt")
     cn.add_argument("--cpp", default="out/net_bot.cpp")
@@ -1642,6 +1731,8 @@ def main():
         sys.exit(cmd_emit(args))
     if args.cmd == "emit-cpp":
         sys.exit(cmd_emit_cpp(args))
+    if args.cmd == "bench-net":
+        sys.exit(cmd_bench_net(args))
     if args.cmd == "check-net":
         sys.exit(cmd_check_net(args))
     if args.cmd == "pack":
