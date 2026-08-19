@@ -2275,6 +2275,13 @@ def cmd_selfcheck(args):
         "non-terminal transition is missing its next-state legal mask"
     assert all(len(t[0]) == N_IN for t in trs), "state width mismatch"
 
+    # GPU engine: a second implementation of the rules is only trustworthy if it
+    # agrees with the verified one. Same discipline as blind_engine.py, but the
+    # divergence here would be silent -- training data would just be wrong.
+    _rc = cmd_gpu_parity(argparse.Namespace(games=8, seed=0, device="cpu",
+                                            check_encode=True))
+    assert _rc == 0, "tensor engine diverged from the reference engine"
+
     # MCTS: with an UNTRAINED net the value head is noise, so only the exact
     # terminal values can carry the search. If it still finds every forced win,
     # the tree, the terminal handling and the backup SIGN are all correct --

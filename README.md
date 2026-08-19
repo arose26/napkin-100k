@@ -314,6 +314,40 @@ The generalisable lesson, which also corrected one of my own numbers: **a time-b
 bot must be benchmarked on an idle machine.** The first `ab` measurement read 0.417 while
 training competed for CPU; re-measured fairly it is 0.467.
 
+### H6 — GPU self-play (registered before results)
+
+The measurement below said the GPU was idle because the *environment* was Python. So the
+environment moved onto the GPU: `TensorUTTT` re-expresses the identical rules as batched
+bitmask arithmetic — masked legal moves, table-lookup win detection, every game stepped in
+lockstep — and candidate expansion goes with it, cloning all 81 moves of every game into
+one batch so a one-ply policy improvement costs a single forward pass. Trajectory staging
+and the replay buffer are preallocated GPU tensors written by scatter and harvested by
+mask, so nothing crosses to the host inside the step loop.
+
+**Verified before trusted.** A second implementation of the rules is worthless until it
+agrees with the reference, and a divergence here would be silent — the training data would
+simply be wrong. `gpu-parity` plays random games in lockstep against the verified engine
+and compares the legal-move **set** every ply, the outcome every game, and the encoder
+feature-for-feature. It passes, and it is wired into `selfcheck` so it cannot drift.
+
+**Throughput measured:**
+
+| loop | finished games/s |
+|---|---|
+| Python AlphaZero loop (previous) | ~3 |
+| GPU engine, raw self-play at batch 8192 | **15,680** |
+| GPU training loop (engine + 81-way expansion + learning) | **33** |
+
+The training figure is lower than raw self-play because every step now evaluates *every
+legal move of every game* — that is real work buying a better policy target, not overhead.
+Removing the last per-step host transfers alone took it from 8 to 33 games/s.
+
+**Registered prediction:** with self-play this much cheaper, the value head gets enough
+data to become a usable evaluator, and the net clears **> 0.50 vs `ab`** — beating the
+plateau that three arrangements of the DQN net all hit. Early signal at 8,080 games:
+**0.550 vs `greedy`**, already above the DQN net's 0.505 and above anything the Python
+AlphaZero loop reached.
+
 ### Where the compute actually goes (measured 2026-08-19)
 
 The obvious response to "the value head needs more training" is to rent a GPU. Measured,
