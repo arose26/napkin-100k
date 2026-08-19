@@ -126,11 +126,50 @@ Repro:
 python3 napkin_100k.py fuzz --other blind_engine.py --level 2 --games 25000 --seed 12
 ```
 
-**H3 — in progress.** Training runs; results land here when they exist, pass or fail.
+**H3 — the net: 1 FALSIFIED, 2 CONFIRMED, 3 FALSIFIED (threshold was wrong), 4 not
+attempted.** 500 iterations of self-play (≈128,000 games) on one laptop GPU, ~34 minutes.
 
-Verified so far: the packer round-trips correctly — a packed checkpoint compiled to
-**97,582 bytes** (2,418 under the cap) and matched torch's chosen move on **180 of 180**
-sampled positions, satisfying H3-3 on a smoke checkpoint.
+**H3-1 — FALSIFIED, and decisively on the part that mattered.** Offline, both seats, in
+the verified engine:
+
+| opponent | net (fp32) | net (int8, as packed) | registered target |
+|---|---|---|---|
+| `random` | 0.868 [0.814, 0.908] | 0.890 [0.839, 0.926] | ≥ 0.90 — **missed, just** |
+| `greedy` | 0.505 [0.436, 0.574] | 0.507 [0.439, 0.576] | ≥ 0.75 — **missed** |
+| `ab` (30 ms) | **0.000** — 0W–60L–0D | — | > 0.50 — **missed utterly** |
+
+The registered null has occurred, so it gets stated in the words it was registered in:
+**a hand-written alpha-beta search beat our net, inside the same 100KB.** The net does
+not lose narrowly to the search; it loses every single game.
+
+Why, without excuses: this net picks its move by evaluating the current position only —
+no lookahead. Its opponent searches roughly eight plies. Ultimate Tic-Tac-Toe is sharply
+tactical, so a one-ply evaluator is playing a fundamentally different and much weaker
+game, and 128k self-play games is a small fraction of what a net needs to compensate.
+The parity between fp32 and int8 above also shows the deficit is *not* a quantisation
+artefact — the net simply is not strong enough yet.
+
+**H3-2 — CONFIRMED.** int8 costs nothing measurable. Against `random` the packed net
+scored **+2.2 points** over fp32 and against `greedy` **+0.2** — both well inside their
+confidence intervals, i.e. no detectable loss, comfortably under the registered 3%
+ceiling. The packed source is **97,324 bytes, 2,676 under the cap.**
+
+**H3-3 — FALSIFIED as written, but the packer is sound and the threshold was wrong.**
+The emitted C++ chose the same move as torch on **94.59%** of positions, not the
+registered ≥ 99.9%. Diagnosis rather than assumption: an independently written **numpy
+int8** reference — implementing the same arithmetic the C++ does, but sharing none of
+its code — agrees with torch on **94.27%**, statistically indistinguishable from the
+C++'s 94.59%. So the C++ faithfully implements int8 inference; the disagreements are
+inherent to quantisation, and they sit on near-ties (median fp32 Q-gap at a
+disagreement **0.0017**, with 93% of disagreements under 0.01 on a Q scale of ±1).
+The registered threshold of 99.9% was simply the wrong bar for an int8 net — it is the
+right bar for a bit-exact fp32 emitter. The honest correction is to gate the packer
+against an int8 reference (which it passes) and to treat fp32↔int8 argmax drift as a
+*measured quantity* (5.7% of decisions, worth ~0 win rate) rather than a defect.
+
+**H3-4 — not attempted.** The net has not been submitted to the arena and will not be
+while it loses 0–60 to a baseline. Putting it on the public ladder now would measure
+nothing that this table has not already measured.
 
 ### Training notes (kept because they cost real time)
 
