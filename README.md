@@ -144,5 +144,44 @@ bit-for-bit (`checksum=-1900643909`), so local timing/accuracy work transfers.
 
 **Wood league: CLEARED (2026-08-19).** The probe bot went **34–0** in its placement
 battles, took rank 1 of its Wood division, and promoted to **Bronze**, where the real
-Ultimate rules begin. Bronze placement was still settling at the time of writing — the
-standing there is recorded below once stable, not before.
+Ultimate rules begin. In Bronze it then ran 141–61 and reached **rank 1 of 5,666 in
+Bronze / global rank 3,005 of 10,070**. (The IDE's "Rank 1" is the rank *inside* the
+current league; the global number is the one to quote, and both are archived in
+`out/ladder_snapshots.jsonl`.)
+
+### H4 — INVALIDATED AS REGISTERED, by our own sequencing error (2026-08-19)
+
+H4 predicted where each scripted baseline would land *starting from Wood*. We then
+submitted the probe bot first — it cleared Wood and promoted the account to Bronze.
+**CodinGame leagues are sticky: there is no demotion.** We did not assume this, we
+measured it: submitting the deliberately terrible `random` baseline afterwards left the
+account in Bronze (global rank **5,101/10,070**, score 19.76) rather than dropping it
+back to Wood.
+
+Consequences, stated plainly rather than papered over:
+
+- "random never promotes out of Wood, bottom half of a Wood division" — **unmeasurable
+  on this account, forever.** The account cannot return to Wood.
+- "greedy promotes to Bronze, bottom third" — the *promotion event* is unobservable; only
+  the resulting Bronze standing is.
+- "ab-id promotes out of Bronze to Silver, middle third" — **still fully measurable**;
+  the Bronze→Silver promotion has not happened yet.
+
+The obvious "fix" — a second account starting fresh in Wood — is **forbidden** (CG staff
+have stated alt accounts are not allowed, and no-multi-account is a standing series
+constraint carried from series 2). So the arm stays dead. This is the cost of submitting
+an instrument before the calibration it was meant to calibrate, and it is exactly the
+kind of thing the registration protocol exists to make visible.
+
+**H4′ (re-registered 2026-08-19, before the greedy/ab runs, replacing the dead arms):**
+with league sticky at Bronze, the measurable calibration is *within-league*. Registered
+predictions, in ladder score and global rank:
+
+1. Ordering will be strict: `random` < `greedy` < `ab-id` in both score and global rank.
+2. `greedy` lands in the **bottom half of Bronze** (global rank worse than 5,600).
+3. `ab-id` **promotes to Silver** (i.e. beats the Bronze boss) within one submission.
+
+Measured so far: `random` — global **5,101/10,070**, score 19.76, Bronze.
+(The probe bot, which is roughly greedy-plus-a-perfect-3×3-opening, scored 30.35 at
+global 3,005 — informative context, but it is not one of the three registered baselines
+and is not used as one.)
