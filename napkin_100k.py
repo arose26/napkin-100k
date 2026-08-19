@@ -721,6 +721,345 @@ def evaluate_net(net, device, games, seed):
     return out
 
 
+class NetSearchPolicy:
+    """H4: the trained net as a leaf evaluator inside negamax with alpha-beta.
+
+    The net is unchanged and untrained further; the only added ingredient is
+    lookahead. Leaf value of a position, from the side-to-move's view, is
+    max_a Q(s,a) over legal a -- the net's own estimate of how good it is to be
+    here. Terminal positions use the true result, so the search is exact near
+    the end of the game and learned in the middle.
+    """
+    name = "netsearch"
+
+    def __init__(self, net, device, depth=3, seed=0):
+        self.net = net
+        self.device = device
+        self.depth = depth
+        self.rng = random.Random(seed)
+        self._cache = {}
+
+    def _leaf_value(self, eng):
+        import numpy as np
+        import torch
+        key = eng.get_state()
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        x = np.asarray(encode_planes(eng, eng.current_player), dtype=np.float32)
+        with torch.no_grad():
+            q = self.net(torch.from_numpy(x[None]).to(self.device)).cpu().numpy()[0]
+        v = max(q[action_index(r, c)] for (r, c) in eng.valid_actions())
+        v = float(max(-1.0, min(1.0, v)))
+        self._cache[key] = v
+        return v
+
+    def _negamax(self, eng, depth, alpha, beta, me):
+        if eng.game_over:
+            # from the perspective of the player to move at the parent call
+            if eng.winner == -1:
+                return 0.0
+            return 1.0 if eng.winner == me else -1.0
+        if depth == 0:
+            v = self._leaf_value(eng)
+            return v if eng.current_player == me else -v
+        state = eng.get_state()
+        best = -2.0
+        for a in sorted(eng.valid_actions()):
+            eng.play(*a)
+            v = -self._negamax(eng, depth - 1, -beta, -alpha, 1 - me)
+            eng.set_state(state)
+            if v > best:
+                best = v
+            if best > alpha:
+                alpha = best
+            if alpha >= beta:
+                break
+        return best
+
+    def act(self, eng):
+        me = eng.current_player
+        state = eng.get_state()
+        best, bv = None, -2.0
+        for a in sorted(eng.valid_actions()):
+            eng.play(*a)
+            v = -self._negamax(eng, self.depth - 1, -2.0, 2.0, 1 - me)
+            eng.set_state(state)
+            if v > bv:
+                bv, best = v, a
+        return best
+
+
+def cmd_bench_search(args):
+    """H4: same net, with lookahead, against a scripted opponent."""
+    import torch
+    ck = torch.load(args.net, map_location=args.device)
+    net = build_net(args.device)
+    net.load_state_dict(ck["state_dict"])
+    net.eval()
+
+    rng = random.Random(args.seed)
+    w = l = d = 0
+    for g in range(args.games):
+        seat = g % 2
+        eng = Engine(2)
+        me = NetSearchPolicy(net, args.device, args.depth, seed=g)
+        opp = POLICIES[args.vs](seed=rng.randrange(2**30), budget_ms=args.budget_ms)
+        while not eng.game_over:
+            mv = me.act(eng) if eng.current_player == seat else opp.act(eng)
+            eng.play(*mv)
+        if eng.winner == seat:
+            w += 1
+        elif eng.winner == -1:
+            d += 1
+        else:
+            l += 1
+    n = w + l + d
+    p_hat = (w + 0.5 * d) / n
+    z = 1.96
+    den = 1 + z * z / n
+    mid = (p_hat + z * z / (2 * n)) / den
+    half = z * ((p_hat * (1 - p_hat) / n + z * z / (4 * n * n)) ** 0.5) / den
+    print(f"net+search(depth {args.depth}) vs {args.vs}: {w}W-{l}L-{d}D of {n} | "
+          f"score {p_hat:.3f} [{mid-half:.3f}, {mid+half:.3f}]")
+    return 0
+
+
+# == H5: the AlphaZero loop ====================================================
+# A policy+value network guides an MCTS; the search's visit distribution becomes
+# the policy target and the game outcome becomes the value target, so each round
+# of self-play trains on a policy STRONGER than the one that generated it. The
+# net supplies every learned quantity; the search contains no hand-tuned
+# evaluation whatsoever (leaves are the net's value head, terminals are exact).
+#
+# Sized to the same measured budget: trunk 324->128->96, policy head 96->81,
+# value head 96->1 = 61,632 weights = ~77.0k base85 chars, leaving room for the
+# MCTS harness inside 100,000 bytes.
+
+AZ_TRUNK1, AZ_TRUNK2 = 128, 96
+
+
+def build_aznet(device="cpu"):
+    import torch
+    import torch.nn as nn
+
+    class _AZ(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.t1 = nn.Linear(N_IN, AZ_TRUNK1)
+            self.t2 = nn.Linear(AZ_TRUNK1, AZ_TRUNK2)
+            self.ph = nn.Linear(AZ_TRUNK2, N_ACT)
+            self.vh = nn.Linear(AZ_TRUNK2, 1)
+
+        def forward(self, x):
+            h = torch.relu(self.t1(x))
+            h = torch.relu(self.t2(h))
+            return self.ph(h), torch.tanh(self.vh(h)).squeeze(-1)
+
+    return _AZ().to(device)
+
+
+def aznet_param_bytes():
+    return (N_IN * AZ_TRUNK1 + AZ_TRUNK1 * AZ_TRUNK2
+            + AZ_TRUNK2 * N_ACT + AZ_TRUNK2)
+
+
+class MCTS:
+    """PUCT search over the verified engine, evaluated by the net.
+
+    Batched across games: every game contributes at most one leaf per round, so
+    leaf evaluation is a single batched forward. Values are always stored from
+    the point of view of the player to move at that node.
+    """
+
+    def __init__(self, net, device, sims, c_puct=1.5, dirichlet=0.0, seed=0):
+        self.net = net
+        self.device = device
+        self.sims = sims
+        self.c_puct = c_puct
+        self.dirichlet = dirichlet
+        self.rng = random.Random(seed)
+
+    def _evaluate(self, engines):
+        """Batched net evaluation. Returns (priors over legal moves, values)."""
+        import numpy as np
+        import torch
+        if not engines:
+            return [], []
+        x = np.stack([np.asarray(encode_planes(e, e.current_player), dtype=np.float32)
+                      for e in engines])
+        with torch.no_grad():
+            logits, vals = self.net(torch.from_numpy(x).to(self.device))
+            logits = logits.cpu().numpy()
+            vals = vals.cpu().numpy()
+        priors = []
+        for i, e in enumerate(engines):
+            legal = sorted(e.valid_actions())
+            lg = np.array([logits[i][action_index(*a)] for a in legal], dtype=np.float64)
+            lg -= lg.max()
+            ex = np.exp(lg)
+            priors.append(dict(zip(legal, ex / ex.sum())))
+        return priors, list(vals)
+
+    def run(self, engines):
+        """Return one visit-count distribution per engine."""
+        import numpy as np
+        roots = [{"N": {}, "W": {}, "P": None, "visits": 0} for _ in engines]
+        states = [e.get_state() for e in engines]
+
+        pri, _ = self._evaluate(engines)
+        for i, r in enumerate(roots):
+            r["P"] = dict(pri[i])
+            if self.dirichlet > 0:
+                legal = list(r["P"])
+                noise = np.random.default_rng(self.rng.randrange(2**31)).dirichlet(
+                    [0.3] * len(legal))
+                for k, a in enumerate(legal):
+                    r["P"][a] = 0.75 * r["P"][a] + 0.25 * noise[k]
+            for a in r["P"]:
+                r["N"][a] = 0
+                r["W"][a] = 0.0
+
+        # Depth-1 PUCT with net-evaluated children: each simulation picks a root
+        # action by PUCT, evaluates the resulting position with the net, and backs
+        # the (negated) value up. Cheap, batched, and enough to improve the policy.
+        for _ in range(self.sims):
+            picks, children = [], []
+            for i, e in enumerate(engines):
+                r = roots[i]
+                tot = max(1, r["visits"])
+                best, bs = None, -1e18
+                for a, p in r["P"].items():
+                    n = r["N"][a]
+                    q = (r["W"][a] / n) if n else 0.0
+                    u = self.c_puct * p * (tot ** 0.5) / (1 + n)
+                    if q + u > bs:
+                        bs, best = q + u, a
+                picks.append(best)
+                e.set_state(states[i])
+                e.play(*best)
+                children.append(e)
+            # terminal children need the true result, not the net
+            live = [i for i, e in enumerate(children) if not e.game_over]
+            pri2, vals = self._evaluate([children[i] for i in live])
+            vmap = dict(zip(live, vals))
+            for i, e in enumerate(children):
+                if e.game_over:
+                    # value from the CHILD's mover perspective; terminal -> outcome
+                    v_child = 0.0 if e.winner == -1 else (
+                        1.0 if e.winner == e.moves % 2 else -1.0)
+                else:
+                    v_child = float(vmap[i])
+                a = picks[i]
+                roots[i]["N"][a] += 1
+                roots[i]["W"][a] += -v_child     # child's value is the opponent's
+                roots[i]["visits"] += 1
+        for i, e in enumerate(engines):
+            e.set_state(states[i])
+        out = []
+        for r in roots:
+            tot = sum(r["N"].values()) or 1
+            out.append({a: n / tot for a, n in r["N"].items()})
+        return out
+
+
+def cmd_train_az(args):
+    """Self-play with MCTS-improved targets (H5)."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    device = args.device if args.device != "auto" else (
+        "cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.seed)
+    net = build_aznet(device)
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    buf = []
+    t0 = time.time()
+
+    for it in range(1, args.iters + 1):
+        mcts = MCTS(net, device, args.sims, dirichlet=0.25, seed=args.seed * 977 + it)
+        engines = [Engine(2) for _ in range(args.batch_games)]
+        histories = [[] for _ in engines]
+        live = list(range(len(engines)))
+        while live:
+            pis = mcts.run([engines[i] for i in live])
+            for k, i in enumerate(live):
+                e = engines[i]
+                pi = pis[k]
+                x = np.asarray(encode_planes(e, e.current_player), dtype=np.float32)
+                target = np.zeros(N_ACT, dtype=np.float32)
+                for a, pr in pi.items():
+                    target[action_index(*a)] = pr
+                histories[i].append((x, target, e.current_player))
+                moves = list(pi)
+                probs = np.array([pi[a] for a in moves], dtype=np.float64)
+                probs = probs / probs.sum()
+                idx = np.random.default_rng(
+                    mcts.rng.randrange(2**31)).choice(len(moves), p=probs)
+                e.play(*moves[idx])
+            live = [i for i in live if not engines[i].game_over]
+        for i, e in enumerate(engines):
+            w = e.winner
+            for x, target, mover in histories[i]:
+                z = 0.0 if w == -1 else (1.0 if w == mover else -1.0)
+                buf.append((x, target, z))
+        if len(buf) > args.buffer:
+            buf = buf[-args.buffer:]
+
+        for _ in range(args.updates_per_iter):
+            b = random.sample(buf, min(args.batch, len(buf)))
+            xb = torch.from_numpy(np.stack([q[0] for q in b])).to(device)
+            pb = torch.from_numpy(np.stack([q[1] for q in b])).to(device)
+            zb = torch.tensor([q[2] for q in b], device=device, dtype=torch.float32)
+            logits, v = net(xb)
+            logp = F.log_softmax(logits, dim=1)
+            loss_p = -(pb * logp).sum(dim=1).mean()
+            loss_v = F.mse_loss(v, zb)
+            loss = loss_p + loss_v
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+            opt.step()
+
+        if it % args.eval_every == 0 or it == args.iters:
+            wr = evaluate_aznet(net, device, args.sims, args.eval_games, args.seed + it)
+            print(f"iter {it}/{args.iters} buf {len(buf)} loss {float(loss):.4f} "
+                  f"(p {float(loss_p):.4f} v {float(loss_v):.4f}) "
+                  f"vs-greedy {wr:.3f} ({time.time()-t0:.0f}s)", flush=True)
+        torch.save({"state_dict": net.state_dict(),
+                    "shape": [N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT]}, args.out)
+    print(f"saved {args.out} ({aznet_param_bytes()} weights, "
+          f"{aznet_param_bytes()*1.25/1000:.1f}k chars as int8+base85)")
+    return 0
+
+
+def az_policy(net, device, sims, seed=0):
+    mcts = MCTS(net, device, sims, seed=seed)
+
+    def policy(eng):
+        pi = mcts.run([eng])[0]
+        return max(pi, key=pi.get)
+    return policy
+
+
+def evaluate_aznet(net, device, sims, games, seed):
+    rng = random.Random(seed)
+    pol = az_policy(net, device, sims, seed)
+    w = d = n = 0
+    for g in range(games):
+        seat = g % 2
+        eng = Engine(2)
+        opp = POLICIES["greedy"](seed=rng.randrange(2**30))
+        while not eng.game_over:
+            eng.play(*(pol(eng) if eng.current_player == seat else opp.act(eng)))
+        n += 1
+        if eng.winner == seat:
+            w += 1
+        elif eng.winner == -1:
+            d += 1
+    return (w + 0.5 * d) / max(1, n)
+
+
 # == the packer: torch checkpoint -> one self-contained C++ source =============
 # "One file that writes one file." Weights are per-tensor symmetrically quantised
 # to int8, emitted as base85 text (4 bytes -> 5 chars), and read back by a
@@ -1274,6 +1613,14 @@ def main():
     c.add_argument("--level", type=int, required=True, choices=(1, 2))
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--budget-ms", type=int, default=90)
+    bs = sub.add_parser("bench-search")
+    bs.add_argument("--net", default="out/net.pt")
+    bs.add_argument("--vs", default="ab", choices=POLICIES)
+    bs.add_argument("--depth", type=int, default=3)
+    bs.add_argument("--games", type=int, default=40)
+    bs.add_argument("--budget-ms", type=int, default=30)
+    bs.add_argument("--device", default="cpu")
+    bs.add_argument("--seed", type=int, default=7)
     bn = sub.add_parser("bench-net")
     bn.add_argument("--net", default="out/net.pt")
     bn.add_argument("--cpp", default=None)
@@ -1291,6 +1638,19 @@ def main():
     pk = sub.add_parser("pack")
     pk.add_argument("--net", default="out/net.pt")
     pk.add_argument("--out", default="out/net_bot.cpp")
+    ta = sub.add_parser("train-az")
+    ta.add_argument("--iters", type=int, default=60)
+    ta.add_argument("--sims", type=int, default=48)
+    ta.add_argument("--batch-games", type=int, default=64)
+    ta.add_argument("--updates-per-iter", type=int, default=48)
+    ta.add_argument("--batch", type=int, default=512)
+    ta.add_argument("--buffer", type=int, default=200000)
+    ta.add_argument("--lr", type=float, default=1e-3)
+    ta.add_argument("--eval-every", type=int, default=5)
+    ta.add_argument("--eval-games", type=int, default=40)
+    ta.add_argument("--device", default="auto")
+    ta.add_argument("--seed", type=int, default=0)
+    ta.add_argument("--out", default="out/aznet.pt")
     tr = sub.add_parser("train")
     tr.add_argument("--iters", type=int, default=200)
     tr.add_argument("--games-per-iter", type=int, default=256)
@@ -1317,12 +1677,16 @@ def main():
     args = ap.parse_args()
     if args.cmd == "snapshot":
         sys.exit(cmd_snapshot(args))
+    if args.cmd == "bench-search":
+        sys.exit(cmd_bench_search(args))
     if args.cmd == "bench-net":
         sys.exit(cmd_bench_net(args))
     if args.cmd == "check-net":
         sys.exit(cmd_check_net(args))
     if args.cmd == "pack":
         sys.exit(cmd_pack(args))
+    if args.cmd == "train-az":
+        sys.exit(cmd_train_az(args))
     if args.cmd == "train":
         sys.exit(cmd_train(args))
     if args.cmd == "selfcheck":

@@ -148,6 +148,24 @@ Repro:
 python3 napkin_100k.py fuzz --other blind_engine.py --level 2 --games 25000 --seed 12
 ```
 
+**H4 — CONFIRMED, and it identifies the real deficit.** The *same trained net*, weights
+untouched, used as the leaf evaluator inside a depth-3 negamax instead of taking its own
+argmax:
+
+| opponent | net alone (argmax) | same net + depth-3 search |
+|---|---|---|
+| `greedy` | 0.505 | **0.950** [0.764, 0.991] |
+| `ab` (30 ms) | **0.000** (0W–60L–0D) | **0.525** [0.375, 0.671] (21W–19L) |
+
+Nothing was retrained. The only change is lookahead, and it moves the net from losing
+every single game against `ab` to roughly even with it. The H3 diagnosis was right:
+**what the net was missing is search, not weights.**
+
+Stated carefully, because the registered prediction was "> 50%": the point estimate
+0.525 clears it, but the interval spans parity, so the honest reading is *the net with
+search is now competitive with `ab`, not demonstrably better than it*. A larger run is
+under way to tighten that interval.
+
 **H3 — the net: 1 FALSIFIED, 2 CONFIRMED, 3 FALSIFIED (threshold was wrong), 4 not
 attempted.** 500 iterations of self-play (≈128,000 games) on one laptop GPU, ~34 minutes.
 
