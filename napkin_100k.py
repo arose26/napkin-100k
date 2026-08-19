@@ -1328,22 +1328,40 @@ int main(){
         int mv[81];
         for(int i=0;i<n;i++){int r,c; if(scanf("%%d%%d",&r,&c)!=2) return 1;
             if(r<0||r>8||c<0||c>8) return 1; mv[i]=r*9+c;}
+        /* venue parity: our own move generator must agree with the referee's
+         * list every turn. If it ever does not, our internal position has
+         * drifted and every search below is about the wrong game. */
+        { int own[81]; int m=legal(p,own);
+          bool same = (m==n);
+          if(same) for(int i=0;i<m && same;i++){ bool f=false;
+              for(int j=0;j<n;j++) if(own[i]==mv[j]){f=true;break;} same=f; }
+          if(!same) fprintf(stderr,"PARITY MISMATCH ours=%%d ref=%%d\n",m,n); }
         int budget = first ? 900 : 85; first=false;
         deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(budget);
         timeUp=false; evals=0;
-        int best=mv[0], reached=0;
+        /* Fallback must never be "the first legal move": under CPU contention the
+         * clock can expire inside depth 1 and leave the choice uninitialised.
+         * Start from the net's own preference, and let depth 1 always finish -
+         * it is ~n leaf evaluations and it is what guarantees a forced win is
+         * seen at all. Only depth >= 2 may be abandoned on time. */
+        encode(p,mv,n); forward(feat);
+        int best=mv[0]; { float bq=-1e30f;
+            for(int k=0;k<n;k++) if(qout[mv[k]]>bq){bq=qout[mv[k]];best=mv[k];} }
+        int reached=0;
         for(int depth=1; depth<=12; depth++){
-            float bv=-2.f; int bm=mv[0];
+            float bv=-2.f; int bm=best;
+            bool aborted=false;
             for(int k=0;k<n;k++){
                 Undo u; bool mw=mk(p,mv[k],u);
                 float v = mw ? 1.f : -negamax(p,depth-1,-2.f,2.f);
                 unmk(p,mv[k],u);
-                if(timeUp) break;
+                if(timeUp && depth>1){ aborted=true; break; }
                 if(v>bv){bv=v;bm=mv[k];}
             }
-            if(timeUp) break;
+            if(aborted) break;
             best=bm; reached=depth;
             if(bv>=1.f) break;
+            if(timeUp) break;
         }
         fprintf(stderr,"depth=%%d evals=%%ld\n",reached,evals);
         Undo u; mk(p,best,u);
@@ -1525,6 +1543,67 @@ def cmd_check_net(args):
     for c, t, g in disagreements:
         print(f"  cpp {c} vs ref {t}, |dQ| = {g:.5f}")
     return 0 if pct >= args.min_agree else 1
+
+
+def cmd_check_bot(args):
+    """Correctness gate for any packed C++ bot, searching or not.
+
+    `check-net` compares against the net's raw argmax and is therefore only
+    meaningful for the argmax bot -- a searching bot is *supposed* to disagree
+    with it. What must hold for either is: every move legal, and every forced
+    win taken (the search knows terminals exactly, so declining one means the
+    value signs are wrong)."""
+    import shutil
+    import subprocess
+    import tempfile
+    import os
+
+    tmp = tempfile.mkdtemp()
+    exe = os.path.join(tmp, "bot")
+    subprocess.run(["g++", "-O2", "-o", exe, args.cpp], check=True)
+    rng = random.Random(args.seed)
+    offered = taken = moves = 0
+    for g in range(args.games):
+        seat = g % 2
+        eng = Engine(2)
+        proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        try:
+            while not eng.game_over:
+                if eng.current_player != seat:
+                    eng.play(*rng.choice(sorted(eng.valid_actions())))
+                    continue
+                va = sorted(eng.valid_actions())
+                st = eng.get_state()
+                wins = []
+                for a in va:
+                    eng.play(*a)
+                    if eng.game_over and eng.winner == seat:
+                        wins.append(a)
+                    eng.set_state(st)
+                last = eng.last if eng.last is not None else (-1, -1)
+                proc.stdin.write(f"{last[0]} {last[1]}\n{len(va)}\n")
+                for a in va:
+                    proc.stdin.write(f"{a[0]} {a[1]}\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                if not line:
+                    raise AssertionError("bot died mid-game")
+                mv = tuple(int(v) for v in line.split())
+                assert mv in eng.valid_actions(), f"ILLEGAL move {mv}; legal={va}"
+                moves += 1
+                if wins:
+                    offered += 1
+                    if mv in wins:
+                        taken += 1
+                eng.play(*mv)
+        finally:
+            proc.kill()
+            proc.wait()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"check-bot {args.cpp}: {moves} moves all legal, "
+          f"forced wins taken {taken}/{offered}")
+    return 0 if offered == taken else 1
 
 
 def cmd_bench_net(args):
@@ -1831,6 +1910,10 @@ def main():
     bs.add_argument("--budget-ms", type=int, default=30)
     bs.add_argument("--device", default="cpu")
     bs.add_argument("--seed", type=int, default=7)
+    cb = sub.add_parser("check-bot")
+    cb.add_argument("--cpp", default="out/net_search_bot.cpp")
+    cb.add_argument("--games", type=int, default=6)
+    cb.add_argument("--seed", type=int, default=5)
     bn = sub.add_parser("bench-net")
     bn.add_argument("--net", default="out/net.pt")
     bn.add_argument("--cpp", default=None)
@@ -1891,6 +1974,8 @@ def main():
         sys.exit(cmd_snapshot(args))
     if args.cmd == "bench-search":
         sys.exit(cmd_bench_search(args))
+    if args.cmd == "check-bot":
+        sys.exit(cmd_check_bot(args))
     if args.cmd == "bench-net":
         sys.exit(cmd_bench_net(args))
     if args.cmd == "check-net":

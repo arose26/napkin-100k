@@ -319,22 +319,40 @@ int main(){
         int mv[81];
         for(int i=0;i<n;i++){int r,c; if(scanf("%d%d",&r,&c)!=2) return 1;
             if(r<0||r>8||c<0||c>8) return 1; mv[i]=r*9+c;}
+        /* venue parity: our own move generator must agree with the referee's
+         * list every turn. If it ever does not, our internal position has
+         * drifted and every search below is about the wrong game. */
+        { int own[81]; int m=legal(p,own);
+          bool same = (m==n);
+          if(same) for(int i=0;i<m && same;i++){ bool f=false;
+              for(int j=0;j<n;j++) if(own[i]==mv[j]){f=true;break;} same=f; }
+          if(!same) fprintf(stderr,"PARITY MISMATCH ours=%d ref=%d\n",m,n); }
         int budget = first ? 900 : 85; first=false;
         deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(budget);
         timeUp=false; evals=0;
-        int best=mv[0], reached=0;
+        /* Fallback must never be "the first legal move": under CPU contention the
+         * clock can expire inside depth 1 and leave the choice uninitialised.
+         * Start from the net's own preference, and let depth 1 always finish -
+         * it is ~n leaf evaluations and it is what guarantees a forced win is
+         * seen at all. Only depth >= 2 may be abandoned on time. */
+        encode(p,mv,n); forward(feat);
+        int best=mv[0]; { float bq=-1e30f;
+            for(int k=0;k<n;k++) if(qout[mv[k]]>bq){bq=qout[mv[k]];best=mv[k];} }
+        int reached=0;
         for(int depth=1; depth<=12; depth++){
-            float bv=-2.f; int bm=mv[0];
+            float bv=-2.f; int bm=best;
+            bool aborted=false;
             for(int k=0;k<n;k++){
                 Undo u; bool mw=mk(p,mv[k],u);
                 float v = mw ? 1.f : -negamax(p,depth-1,-2.f,2.f);
                 unmk(p,mv[k],u);
-                if(timeUp) break;
+                if(timeUp && depth>1){ aborted=true; break; }
                 if(v>bv){bv=v;bm=mv[k];}
             }
-            if(timeUp) break;
+            if(aborted) break;
             best=bm; reached=depth;
             if(bv>=1.f) break;
+            if(timeUp) break;
         }
         fprintf(stderr,"depth=%d evals=%ld\n",reached,evals);
         Undo u; mk(p,best,u);

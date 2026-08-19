@@ -192,18 +192,36 @@ compute-hungry and this is a fraction of what it needs. **Registered prediction 
 **The search ceiling.** Putting the H3/H4/H5 numbers side by side against the same
 opponent tells a cleaner story than any of them alone:
 
-| player | vs `ab` |
-|---|---|
-| DQN net alone (argmax, no search) | 0.000 |
-| same net + depth-3 negamax (Python, fp32) | 0.506 |
-| same net + iterative-deepening negamax (C++, int8, reaches depth 4) | **0.417** |
+| player | vs `ab` | games |
+|---|---|---|
+| DQN net alone (argmax, no search) | 0.000 | 60 |
+| same net + depth-3 negamax (Python, fp32) | 0.506 | 160 |
+| same net + iterative-deepening negamax (C++, int8, depth 4) | 0.467 | 60 |
 
-Searching *deeper* made it **worse**. That is the signature of a poor evaluation
-function: deeper search amplifies evaluation error instead of averaging it out. The DQN
-net was trained to rank moves for argmax selection, not to score positions, and it shows
-the moment it is asked to be an evaluator. So the ceiling at parity in H4 is not a
-coincidence of depth — it is the quality of the learned evaluation, which is exactly
-what the AlphaZero value head is meant to fix and exactly what more compute would buy.
+Deeper search did **not** help. Three separate arrangements of the same weights all land
+at or just below parity with `ab`, and the deepest of them is not the best. That is the
+signature of a weak *evaluation function*: extra depth propagates evaluation error rather
+than averaging it away. The DQN net was trained to rank moves for argmax selection, not
+to score positions, and it shows the moment it is asked to be an evaluator. The H4 ceiling
+is therefore not an artefact of depth — it is the quality of the learned evaluation, which
+is exactly what an AlphaZero value head is meant to fix and exactly what more compute
+would buy.
+
+The packed searching bot is nonetheless a working artefact: **97,321 bytes** including
+weights and search, 2,679 under the cap, reaching depth 4 inside the turn budget and
+scoring 0.917 against `greedy`.
+
+**A robustness bug the correctness gate caught.** `check-bot` — which asserts that a
+packed bot never plays an illegal move and never declines a forced win — found the
+searching bot declining wins. The cause was not the search: with the machine idle it takes
+**10 of 10**, and the emitted bot's own move generator reported **zero** disagreements
+with the referee's legal list. It was CPU contention from a concurrent training run
+exhausting the turn budget, at which point the bot fell back to whatever move happened to
+be first. Two fixes: the fallback is now the net's own highest-Q move rather than an
+arbitrary one, and depth 1 is never abandoned on time, so a forced win is always seen.
+The lesson generalises beyond this bug — **every benchmark of a time-budgeted bot must be
+run on an idle machine.** The 0.467 above is a re-measurement after that was fixed; the
+first attempt, taken while training ran, read 0.417.
 
 The packed searching bot is nonetheless a working artefact: **96,689 bytes** including
 weights and search, 3,311 under the cap, reaching depth 4 inside the turn budget and
