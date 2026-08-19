@@ -689,6 +689,8 @@ def cmd_snapshot(args):
                   "league_index": (u.get("league") or {}).get("divisionIndex")}
                  for u in (top.get("users") or [])[:5]],
     }
+    import os
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "a") as f:
         f.write(json.dumps(snap) + "\n")
     print(json.dumps(snap))
@@ -766,6 +768,19 @@ def cmd_selfcheck(args):
     # optimize pragma (CG compiles -O0) and miscounted source size.
     assert '#pragma GCC optimize' in PROBE_CPP
     assert len(PROBE_CPP.encode("utf-8")) < 100000  # the venue's real cap (measured)
+
+    # Emitted bots must be standalone: no argparse main left to swallow argv, a
+    # bootstrap call present, and still under the byte cap.
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+    buf = io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+        cmd_emit(argparse.Namespace(policy="greedy", level=2, seed=0, budget_ms=85))
+    bot = buf.getvalue()
+    assert 'if __name__ == "__main__":\n    main()' not in bot
+    assert "cmd_cg(_ap.Namespace(policy='greedy'" in bot
+    assert len(bot.encode("utf-8")) < 100000
+    compile(bot, "emitted_bot", "exec")  # must at least parse
 
     print("selfcheck OK")
     return 0
