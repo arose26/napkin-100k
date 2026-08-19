@@ -792,10 +792,309 @@ int main() {
 '''
 
 
+AB2_CPP = r'''/* napkin-100k series: TUNED alpha-beta for Ultimate Tic-Tac-Toe (napkin-referee H6).
+ * Over the straight port: negamax + Zobrist transposition table, move ordering
+ * (TT move / immediate board win / block / killers / history), make-unmake instead
+ * of copying the position, and a UTTT-aware evaluation.
+ * Disclosed bot - see the Napkin100k profile and github.com/arose26/napkin-referee.
+ * CG compiles at -O0 by default, hence the pragma. */
+#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <chrono>
+#include <algorithm>
+
+typedef uint16_t u16;
+typedef uint64_t u64;
+static const u16 WIN[8] = {0700, 070, 07, 0444, 0222, 0111, 0421, 0124};
+static const u16 FULL = 0777;
+static const int INF = 1 << 28;
+static const int MATE = 1 << 20;
+
+static bool WINTAB[512];       // is this 9-bit mask a 3-in-a-row?
+static int THREAT[512][512];   // threats(mine, block) precomputed
+
+static inline int popc(unsigned x) { return __builtin_popcount(x); }
+
+static void initTables() {
+    for (int m = 0; m < 512; m++) {
+        bool w = false;
+        for (int i = 0; i < 8; i++) if ((m & WIN[i]) == WIN[i]) w = true;
+        WINTAB[m] = w;
+    }
+    for (int m = 0; m < 512; m++)
+        for (int b = 0; b < 512; b++) {
+            int n = 0;
+            for (int i = 0; i < 8; i++)
+                if (!(b & WIN[i]) && popc(m & WIN[i]) == 2) n++;
+            THREAT[m][b] = n;
+        }
+}
+
+/* master-board positional weights: centre is worth most, then corners.
+ * A small board's value is how much winning it helps the master line. */
+static const int CELLW[9] = {3, 2, 3, 2, 4, 2, 3, 2, 3};
+
+static u64 Z_CELL[81][2], Z_TARGET[10], Z_SIDE;
+static u64 rng_s = 88172645463325252ULL;
+static u64 rnd() { rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17; return rng_s; }
+static void initZobrist() {
+    for (int i = 0; i < 81; i++) for (int p = 0; p < 2; p++) Z_CELL[i][p] = rnd();
+    for (int i = 0; i < 10; i++) Z_TARGET[i] = rnd();
+    Z_SIDE = rnd();
+}
+
+struct Pos {
+    u16 b[2][9];
+    u16 own[2];
+    u16 drawn;
+    int last;      // previous move cell, -1 at game start
+    int side;      // to move
+    int cnt[2];    // small boards won
+    u64 key;
+};
+
+static inline int targetBoard(const Pos& p) {
+    if (p.last < 0) return -1;
+    return ((p.last / 9) % 3) * 3 + (p.last % 9) % 3;
+}
+static inline bool decided(const Pos& p, int b) {
+    return ((p.own[0] | p.own[1] | p.drawn) >> b) & 1;
+}
+// -1 means "free choice of any undecided board"
+static inline int activeBoard(const Pos& p) {
+    int t = targetBoard(p);
+    return (t >= 0 && !decided(p, t)) ? t : -1;
+}
+
+static int legal(const Pos& p, int* out) {
+    int n = 0, ab = activeBoard(p);
+    for (int b = 0; b < 9; b++) {
+        if (ab >= 0 && b != ab) continue;
+        if (decided(p, b)) continue;
+        u16 occ = (u16)(p.b[0][b] | p.b[1][b]);
+        int br = (b / 3) * 3, bc = (b % 3) * 3;
+        for (int i = 0; i < 9; i++)
+            if (!((occ >> i) & 1)) out[n++] = (br + i / 3) * 9 + bc + i % 3;
+    }
+    return n;
+}
+
+struct Undo { u16 own0, own1, drawn; int last, cnt0, cnt1; u64 key; };
+
+// returns true if the mover just completed the master board
+static inline bool makeMove(Pos& p, int cell, Undo& u) {
+    u.own0 = p.own[0]; u.own1 = p.own[1]; u.drawn = p.drawn;
+    u.last = p.last; u.cnt0 = p.cnt[0]; u.cnt1 = p.cnt[1]; u.key = p.key;
+    int r = cell / 9, c = cell % 9;
+    int b = (r / 3) * 3 + c / 3, i = (r % 3) * 3 + (c % 3);
+    int s = p.side;
+    p.b[s][b] |= (u16)(1 << i);
+    p.key ^= Z_CELL[cell][s];
+    bool masterWin = false;
+    if (WINTAB[p.b[s][b]]) {
+        p.own[s] |= (u16)(1 << b);
+        p.cnt[s]++;
+        if (WINTAB[p.own[s]]) masterWin = true;
+    } else if ((p.b[0][b] | p.b[1][b]) == FULL) {
+        p.drawn |= (u16)(1 << b);
+    }
+    p.key ^= Z_TARGET[targetBoard(p) < 0 ? 9 : targetBoard(p)];
+    p.last = cell;
+    p.key ^= Z_TARGET[targetBoard(p) < 0 ? 9 : targetBoard(p)];
+    p.side = 1 - s;
+    p.key ^= Z_SIDE;
+    return masterWin;
+}
+
+static inline void unmakeMove(Pos& p, int cell, const Undo& u) {
+    int r = cell / 9, c = cell % 9;
+    int b = (r / 3) * 3 + c / 3, i = (r % 3) * 3 + (c % 3);
+    p.side = 1 - p.side;
+    p.b[p.side][b] &= (u16)~(1 << i);
+    p.own[0] = u.own0; p.own[1] = u.own1; p.drawn = u.drawn;
+    p.last = u.last; p.cnt[0] = u.cnt0; p.cnt[1] = u.cnt1; p.key = u.key;
+}
+
+/* Evaluation, from `me`'s point of view. Terms, in order of weight:
+ *   - small boards won, weighted by how useful that master cell is
+ *   - master-board threats (two cells of a line, third still winnable)
+ *   - threats inside still-open small boards
+ *   - a small penalty for leaving the opponent a free choice of board */
+static int evaluate(const Pos& p, int me) {
+    int opp = 1 - me, v = 0;
+    for (int b = 0; b < 9; b++) {
+        if ((p.own[me] >> b) & 1) v += 20 * CELLW[b];
+        else if ((p.own[opp] >> b) & 1) v -= 20 * CELLW[b];
+    }
+    v += 12 * (THREAT[p.own[me]][p.own[opp] | p.drawn]
+             - THREAT[p.own[opp]][p.own[me] | p.drawn]);
+    for (int b = 0; b < 9; b++)
+        if (!decided(p, b))
+            v += THREAT[p.b[me][b]][p.b[opp][b]] - THREAT[p.b[opp][b]][p.b[me][b]];
+    if (activeBoard(p) < 0) {           // side to move picks any board: small edge
+        v += (p.side == me) ? 6 : -6;
+    }
+    return v;
+}
+
+/* transposition table */
+struct TT { u64 key; int32_t value; int16_t move; int8_t depth; int8_t flag; };
+static const int TT_BITS = 22;                 // 4M entries * 16B = 64MB < 768MB limit
+static const int TT_SIZE = 1 << TT_BITS;
+static TT* tt;
+static const int F_EXACT = 0, F_LOWER = 1, F_UPPER = 2;
+
+static int killer[96][2];
+static int history[81];
+
+static std::chrono::steady_clock::time_point deadline;
+static bool timeUp = false;
+static long nodes = 0;
+static inline bool checkTime() {
+    if ((++nodes & 511) == 0 && std::chrono::steady_clock::now() > deadline) timeUp = true;
+    return timeUp;
+}
+
+/* negamax: score is always from the side-to-move's point of view */
+static int negamax(Pos& p, int depth, int alpha, int beta, int ply) {
+    if (timeUp || checkTime()) return 0;
+
+    int mv[81];
+    int n = legal(p, mv);
+    if (n == 0) {                       // board exhausted: most small boards wins
+        int d = p.cnt[p.side] - p.cnt[1 - p.side];
+        return d > 0 ? MATE - ply : (d < 0 ? -(MATE - ply) : 0);
+    }
+    if (depth <= 0) return evaluate(p, p.side);
+
+    TT& e = tt[p.key & (TT_SIZE - 1)];
+    int ttMove = -1;
+    if (e.key == p.key) {
+        ttMove = e.move;
+        if (e.depth >= depth) {
+            if (e.flag == F_EXACT) return e.value;
+            if (e.flag == F_LOWER && e.value > alpha) alpha = e.value;
+            else if (e.flag == F_UPPER && e.value < beta) beta = e.value;
+            if (alpha >= beta) return e.value;
+        }
+    }
+
+    // order moves: TT move, immediate master/board win, block, killers, history
+    int score[81];
+    int me = p.side, opp = 1 - me;
+    for (int k = 0; k < n; k++) {
+        int cell = mv[k], s = 0;
+        int b = (cell / 9 / 3) * 3 + (cell % 9) / 3, i = (cell / 9 % 3) * 3 + (cell % 9) % 3;
+        u16 after = (u16)(p.b[me][b] | (1 << i));
+        if (cell == ttMove) s = 1 << 24;
+        else {
+            if (WINTAB[after]) {
+                s += 1 << 20;                              // wins this small board
+                u16 ow = (u16)(p.own[me] | (1 << b));
+                if (WINTAB[ow]) s += 1 << 22;              // ...and the game
+                s += 200 * CELLW[b];
+            }
+            u16 theirs = (u16)(p.b[opp][b] | (1 << i));
+            if (WINTAB[theirs]) s += 1 << 18;              // denies their board win
+            if (cell == killer[ply][0]) s += 1 << 17;
+            else if (cell == killer[ply][1]) s += 1 << 16;
+            // sending the opponent to a decided board hands them a free pick
+            int tb = (cell / 9 % 3) * 3 + (cell % 9) % 3;
+            if (decided(p, tb)) s -= 1 << 15;
+            s += history[cell];
+        }
+        score[k] = s;
+    }
+
+    int best = -INF, bestMove = mv[0], origAlpha = alpha;
+    for (int k = 0; k < n; k++) {
+        int pick = k;
+        for (int j = k + 1; j < n; j++) if (score[j] > score[pick]) pick = j;
+        std::swap(mv[k], mv[pick]); std::swap(score[k], score[pick]);
+        int cell = mv[k];
+
+        Undo u;
+        bool masterWin = makeMove(p, cell, u);
+        int v;
+        if (masterWin) v = MATE - ply;          // we just won; opponent never moves
+        else v = -negamax(p, depth - 1, -beta, -alpha, ply + 1);
+        unmakeMove(p, cell, u);
+
+        if (timeUp) return 0;
+        if (v > best) { best = v; bestMove = cell; }
+        if (v > alpha) alpha = v;
+        if (alpha >= beta) {
+            if (cell != killer[ply][0]) { killer[ply][1] = killer[ply][0]; killer[ply][0] = cell; }
+            history[cell] += depth * depth;
+            break;
+        }
+    }
+
+    e.key = p.key; e.value = best; e.move = (int16_t)bestMove; e.depth = (int8_t)depth;
+    e.flag = (int8_t)(best <= origAlpha ? F_UPPER : (best >= beta ? F_LOWER : F_EXACT));
+    return best;
+}
+
+int main() {
+    initTables(); initZobrist();
+    tt = (TT*)calloc(TT_SIZE, sizeof(TT));
+    Pos p;
+    memset(&p, 0, sizeof(p));
+    p.last = -1; p.side = 0; p.key = 0;
+    bool first = true;
+    while (true) {
+        int orow, ocol;
+        if (scanf("%d%d", &orow, &ocol) != 2) return 0;
+        if (orow < -1 || orow > 8 || ocol < -1 || ocol > 8) return 1;
+        if (orow >= 0 && ocol >= 0) { Undo u; makeMove(p, orow * 9 + ocol, u); }
+        int n;
+        if (scanf("%d", &n) != 1 || n < 1 || n > 81) return 1;
+        int refmv[81];
+        for (int i = 0; i < n; i++) {
+            int r, c;
+            if (scanf("%d%d", &r, &c) != 2) return 1;
+            if (r < 0 || r > 8 || c < 0 || c > 8) return 1;
+            refmv[i] = r * 9 + c;
+        }
+        int budget = first ? 950 : 90;
+        first = false;
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
+        timeUp = false; nodes = 0;
+        memset(killer, -1, sizeof(killer));
+        memset(history, 0, sizeof(history));
+
+        int best = refmv[0], depthReached = 0;
+        for (int depth = 1; depth <= 81; depth++) {
+            int localBest = -INF, localMove = refmv[0], alpha = -INF;
+            for (int k = 0; k < n; k++) {
+                Undo u;
+                bool w = makeMove(p, refmv[k], u);
+                int v = w ? MATE : -negamax(p, depth - 1, -INF, -alpha, 1);
+                unmakeMove(p, refmv[k], u);
+                if (timeUp) break;
+                if (v > localBest) { localBest = v; localMove = refmv[k]; }
+                if (v > alpha) alpha = v;
+            }
+            if (timeUp) break;
+            best = localMove; depthReached = depth;
+            if (localBest >= MATE - 64) break;         // forced win, stop searching
+        }
+        fprintf(stderr, "depth=%d nodes=%ld\n", depthReached, nodes);
+        Undo u; makeMove(p, best, u);
+        printf("%d %d\n", best / 9, best % 9);
+        fflush(stdout);
+    }
+}
+'''
+
+
 def cmd_emit_cpp(args):
-    sys.stdout.write(AB_CPP)
-    print(f"emitted ab-cpp: {len(AB_CPP.encode('utf-8'))} UTF-8 bytes (cap 100000)",
-          file=sys.stderr)
+    src = AB2_CPP if args.version == "tuned" else AB_CPP
+    sys.stdout.write(src)
+    print(f"emitted ab-cpp ({args.version}): {len(src.encode('utf-8'))} UTF-8 bytes "
+          f"(cap 100000)", file=sys.stderr)
     return 0
 
 
@@ -992,6 +1291,7 @@ def main():
     p = sub.add_parser("probe")
     p.add_argument("--utf16-blob", action="store_true")
     ec = sub.add_parser("emit-cpp")
+    ec.add_argument("--version", choices=("port", "tuned"), default="tuned")
     e = sub.add_parser("emit")
     e.add_argument("--policy", required=True, choices=POLICIES)
     e.add_argument("--level", type=int, default=2, choices=(1, 2))
