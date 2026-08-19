@@ -335,6 +335,24 @@ int main(){
          * Start from the net's own preference, and let depth 1 always finish -
          * it is ~n leaf evaluations and it is what guarantees a forced win is
          * seen at all. Only depth >= 2 may be abandoned on time. */
+        /* An immediately winning move is exact knowledge, not something worth
+         * spending a time-budgeted search on. Check it directly so this case can
+         * never depend on the clock. A win is either a master line (mk reports it)
+         * or exhaustion with more small boards. */
+        int winNow=-1;
+        { for(int k=0;k<n;k++){
+              Undo u; bool mw=mk(p,mv[k],u);
+              bool won=mw;
+              if(!won){ int tmp[81]; if(legal(p,tmp)==0)
+                        won = p.cnt[1-p.side] > p.cnt[p.side]; }
+              unmk(p,mv[k],u);
+              if(won){ winNow=mv[k]; break; } } }
+        if(winNow>=0){
+            Undo u2; mk(p,winNow,u2);
+            printf("%d %d\n",winNow/9,winNow%9); fflush(stdout);
+            continue;
+        }
+
         encode(p,mv,n); forward(feat);
         int best=mv[0]; { float bq=-1e30f;
             for(int k=0;k<n;k++) if(qout[mv[k]]>bq){bq=qout[mv[k]];best=mv[k];} }
@@ -355,7 +373,7 @@ int main(){
             if(timeUp) break;
         }
         fprintf(stderr,"depth=%d evals=%ld\n",reached,evals);
-        Undo u; mk(p,best,u);
+        { Undo u; mk(p,best,u); }
         printf("%d %d\n",best/9,best%9); fflush(stdout);
     }
 }
