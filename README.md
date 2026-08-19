@@ -321,10 +321,23 @@ only ever start from that floor. Scripted code has already spent Wood → Bronze
 exact climb the series exists to demonstrate. This is the **same sticky-league trap that
 killed H4**, walked into a second time.
 
-**Rule adopted for the rest of the series:** scripted baselines are measured
-**offline only**, head-to-head in this repo's verified engine. **The public ladder is
-reserved for the net.** The bar the net must clear is now a number, not a league:
-beat the measured baselines offline, and beat global rank 1,804.
+**Rule adopted for the rest of the series**, stated precisely so it is actually
+followable:
+
+1. **No further scripted submissions.** The C++ port already on the arena is the *last*
+   one. Every future submission is the net.
+2. The deployed baseline is **not** removed — Silver is already spent and CodinGame has
+   no demotion, so pulling it would un-spend nothing and would only add ladder churn.
+   It stays as the disclosed calibration bot it was submitted as.
+3. **It must be replaced by the net before it can qualify for the next league.** Gold is
+   already earned and cannot be given back; Legend must be earned by the net or not at
+   all. This is the headroom that is actually still protectable, so it is the line that
+   matters.
+4. Scripted baselines beyond that are measured **offline only**, head-to-head in this
+   repo's verified engine.
+
+The bar the net must clear is therefore a number, not a league: beat the measured
+baselines offline, and beat global rank 1,804.
 
 The withdrawn text follows, unedited, for the record.
 
