@@ -107,6 +107,7 @@ predicted scores, compared against the referee's.
 
 Level 2: **2,412 games / 137,250 plies, 0 valid-action-set mismatches, 0 outcome
 disagreements** on the 2,329 games that reached a comparable end state.
+Level 1: **700 games / 5,309 plies, 0 mismatches, 0 disagreements, 0 eliminations.**
 
 Two caveats, recorded rather than smoothed over:
 - **83 of 2,412 games (3.4%) ended with our agent eliminated on time** (referee score
@@ -115,8 +116,11 @@ Two caveats, recorded rather than smoothed over:
   coinciding with heavy concurrent load on this laptop (arena submissions, a browser
   automation wait, an API-calling code review) — a logic fault would scatter across
   seeds instead. `python3 napkin_referee.py cg` runs an interpreted alpha-beta inside
-  a 100 ms turn, so it is genuinely load-sensitive. Re-running the exact eliminated
-  seeds on an idle machine is the check; the result is recorded below.
+  a 100 ms turn, so it is genuinely load-sensitive. **Checked, not assumed:** re-running
+  the first eliminated burst (24 seeds, 301857–301880) on an idle machine produced
+  **0 eliminations and 0 mismatches** — the engine is exonerated, the timeouts were
+  environmental. Repro:
+  `java -cp <...> FuzzMain 24 2 301857`.
 - The level-2 run terminated after 2,412 of 2,600 requested games without printing its
   summary line. Its stderr had been discarded, so the cause is unrecorded — an honest
   gap in the instrumentation, fixed by keeping stderr next time. The data collected
@@ -232,3 +236,28 @@ context, not a registered baseline.
 **Calibration handed to napkin-selfplay:** a trained net must beat **global ~1,804**
 to be worth reporting at all, since a ~60-line alpha-beta with a naive eval already gets
 there. Silver→Gold is the first rung that costs something.
+
+### H5 — "is Gold reachable with just a language change?" (registered 2026-08-19,
+### before submitting)
+
+`ab-id` reached the top of Silver as *interpreted Python*. The obvious untested lever is
+that the language, not the algorithm, is the binding constraint — so this is a clean
+one-variable experiment, and it doubles as a rehearsal for napkin-forge's C++ harness.
+
+`napkin_referee.py emit-cpp` emits the **same search and the same eval terms** in C++
+(6,333 bytes; identical negamax + alpha-beta, identical threat/board-count evaluation).
+The only intended difference is nodes per turn. Measured before submission:
+
+- Depth reached on the opening position within one turn budget: **8 ply, 1,048,576
+  nodes** (the Python version manages 2–3 ply in the same wall-clock).
+- Head-to-head against the deployed Python `ab-id`, both sides, via the official
+  referee: **16W – 3L – 1D of 20**.
+- Legality: 20/20 games vs `random` through the official referee with no eliminations,
+  so its move generation agrees with the venue.
+
+**Registered prediction:** the C++ port **promotes Silver → Gold on a single
+submission**. Rationale: it is strictly the stronger player against the exact bot
+currently ranked #1 in Silver, and promotion only requires beating the Silver boss.
+**Registered risk:** Gold holds 1,385 bots and is where real MCTS implementations start;
+"promotes to Gold" is the claim, *not* "ranks well inside Gold" — a bottom-of-Gold
+finish would still confirm this hypothesis and should not be dressed up as more.

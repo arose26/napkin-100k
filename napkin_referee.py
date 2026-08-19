@@ -619,6 +619,186 @@ int main() {
 '''
 
 
+AB_CPP = r'''/* napkin-100k series: the `ab` baseline ported to C++ (napkin-referee).
+ * Same search and same eval terms as the Python ABPolicy in napkin_referee.py -
+ * the ONLY intended difference is nodes searched per turn. Disclosed bot, see
+ * the Napkin100k profile and github.com/arose26/napkin-referee.
+ * CG compiles at -O0 by default, hence the pragma. */
+#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <chrono>
+#include <algorithm>
+
+typedef uint16_t u16;
+static const u16 WIN[8] = {0700, 070, 07, 0444, 0222, 0111, 0421, 0124};
+static const u16 FULL = 0777;
+
+static inline bool wins(u16 m) {
+    for (int i = 0; i < 8; i++) if ((m & WIN[i]) == WIN[i]) return true;
+    return false;
+}
+// lines where `mine` has exactly 2 and `block` none  (same term as the Python eval)
+static inline int threats(u16 mine, u16 block) {
+    int n = 0;
+    for (int i = 0; i < 8; i++)
+        if (!(block & WIN[i]) && __builtin_popcount((unsigned)(mine & WIN[i])) == 2) n++;
+    return n;
+}
+
+struct Pos {
+    u16 b[2][9];   // per-player occupancy of each small board
+    u16 own[2];    // boards won, as a 9-bit mask
+    u16 drawn;     // boards full with no winner
+    int last;      // previous move cell 0..80, -1 if none
+    int side;      // player to move: 0 or 1
+    int cnt[2];    // small boards won (the referee's running score)
+};
+
+static inline bool decided(const Pos& p, int b) {
+    return ((p.own[0] | p.own[1] | p.drawn) >> b) & 1;
+}
+
+// writes legal cells (0..80) into out[], returns how many
+static int legal(const Pos& p, int* out) {
+    int n = 0;
+    int tb = p.last < 0 ? -1 : ((p.last / 9) % 3) * 3 + (p.last % 9) % 3;
+    if (tb >= 0 && !decided(p, tb)) {
+        u16 occ = p.b[0][tb] | p.b[1][tb];
+        int br = (tb / 3) * 3, bc = (tb % 3) * 3;
+        for (int i = 0; i < 9; i++)
+            if (!((occ >> i) & 1)) out[n++] = (br + i / 3) * 9 + bc + i % 3;
+        return n;
+    }
+    for (int b = 0; b < 9; b++) {
+        if (decided(p, b)) continue;
+        u16 occ = p.b[0][b] | p.b[1][b];
+        int br = (b / 3) * 3, bc = (b % 3) * 3;
+        for (int i = 0; i < 9; i++)
+            if (!((occ >> i) & 1)) out[n++] = (br + i / 3) * 9 + bc + i % 3;
+    }
+    return n;
+}
+
+// returns true if this move ended the game with `side` winning the master board
+static bool apply(Pos& p, int cell) {
+    int r = cell / 9, c = cell % 9;
+    int b = (r / 3) * 3 + c / 3, i = (r % 3) * 3 + (c % 3);
+    int s = p.side;
+    p.b[s][b] |= (u16)(1 << i);
+    bool masterWin = false;
+    if (wins(p.b[s][b])) {
+        p.own[s] |= (u16)(1 << b);
+        p.cnt[s]++;
+        if (wins(p.own[s])) masterWin = true;
+    } else if ((p.b[0][b] | p.b[1][b]) == FULL) {
+        p.drawn |= (u16)(1 << b);
+    }
+    p.last = cell;
+    p.side = 1 - s;
+    return masterWin;
+}
+
+static int evaluate(const Pos& p, int me) {
+    int opp = 1 - me;
+    int v = 100 * (p.cnt[me] - p.cnt[opp]);
+    v += 10 * (threats(p.own[me], (u16)(p.own[opp] | p.drawn))
+             - threats(p.own[opp], (u16)(p.own[me] | p.drawn)));
+    for (int b = 0; b < 9; b++)
+        if (!decided(p, b))
+            v += threats(p.b[me][b], p.b[opp][b]) - threats(p.b[opp][b], p.b[me][b]);
+    return v;
+}
+
+static std::chrono::steady_clock::time_point deadline;
+static bool timeUp = false;
+static long nodes = 0;
+static inline bool outOfTime() {
+    if ((++nodes & 1023) == 0 && std::chrono::steady_clock::now() > deadline) timeUp = true;
+    return timeUp;
+}
+
+static const int WIN_SCORE = 30000;
+
+static int search(Pos& p, int depth, int alpha, int beta, int me, bool ended, int winner) {
+    if (ended) return winner == me ? WIN_SCORE - (64 - depth) : -(WIN_SCORE - (64 - depth));
+    int mv[81];
+    int n = legal(p, mv);
+    if (n == 0) {  // no moves: most small boards won decides it
+        int d = p.cnt[me] - p.cnt[1 - me];
+        return d > 0 ? WIN_SCORE - 100 : d < 0 ? -(WIN_SCORE - 100) : 0;
+    }
+    if (depth == 0) return evaluate(p, me);
+    if (outOfTime()) return evaluate(p, me);
+    bool maxing = (p.side == me);
+    int best = maxing ? -WIN_SCORE * 2 : WIN_SCORE * 2;
+    for (int k = 0; k < n; k++) {
+        Pos q = p;
+        bool w = apply(q, mv[k]);
+        int v = search(q, depth - 1, alpha, beta, me, w, w ? p.side : -1);
+        if (maxing) { if (v > best) best = v; if (best > alpha) alpha = best; }
+        else        { if (v < best) best = v; if (best < beta)  beta  = best; }
+        if (beta <= alpha) break;
+        if (timeUp) break;
+    }
+    return best;
+}
+
+int main() {
+    Pos p;
+    memset(&p, 0, sizeof(p));
+    p.last = -1; p.side = 0;
+    bool first = true;
+    while (true) {
+        int orow, ocol;
+        if (scanf("%d%d", &orow, &ocol) != 2) return 0;
+        if (orow < -1 || orow > 8 || ocol < -1 || ocol > 8) return 1;
+        if (orow >= 0 && ocol >= 0) apply(p, orow * 9 + ocol);
+        int n;
+        if (scanf("%d", &n) != 1 || n < 1 || n > 81) return 1;
+        int refmv[81];
+        for (int i = 0; i < n; i++) {
+            int r, c;
+            if (scanf("%d%d", &r, &c) != 2) return 1;
+            if (r < 0 || r > 8 || c < 0 || c > 8) return 1;
+            refmv[i] = r * 9 + c;
+        }
+        // budget: 100ms per turn, 1000ms on the first - stay well inside both
+        int budget = first ? 900 : 88;
+        first = false;
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
+        timeUp = false; nodes = 0;
+        int me = p.side;
+        int best = refmv[0], depthReached = 0;
+        for (int depth = 1; depth <= 81 && !timeUp; depth++) {
+            int localBest = -WIN_SCORE * 2, localMove = refmv[0];
+            for (int k = 0; k < n; k++) {
+                Pos q = p;
+                bool w = apply(q, refmv[k]);
+                int v = search(q, depth - 1, -WIN_SCORE * 2, WIN_SCORE * 2, me, w, w ? me : -1);
+                if (timeUp) break;
+                if (v > localBest) { localBest = v; localMove = refmv[k]; }
+            }
+            if (!timeUp) { best = localMove; depthReached = depth; }
+            if (localBest >= WIN_SCORE - 200) break;   // forced win found
+        }
+        fprintf(stderr, "depth=%d nodes=%ld\n", depthReached, nodes);
+        apply(p, best);
+        printf("%d %d\n", best / 9, best % 9);
+        fflush(stdout);
+    }
+}
+'''
+
+
+def cmd_emit_cpp(args):
+    sys.stdout.write(AB_CPP)
+    print(f"emitted ab-cpp: {len(AB_CPP.encode('utf-8'))} UTF-8 bytes (cap 100000)",
+          file=sys.stderr)
+    return 0
+
+
 def cmd_emit(args):
     """Print a standalone CodinGame Python bot: this file plus a bootstrap that
     runs the chosen policy over the CG protocol. (A file that writes a file.)"""
@@ -811,6 +991,7 @@ def main():
     c.add_argument("--budget-ms", type=int, default=90)
     p = sub.add_parser("probe")
     p.add_argument("--utf16-blob", action="store_true")
+    ec = sub.add_parser("emit-cpp")
     e = sub.add_parser("emit")
     e.add_argument("--policy", required=True, choices=POLICIES)
     e.add_argument("--level", type=int, default=2, choices=(1, 2))
@@ -827,6 +1008,8 @@ def main():
         sys.exit(cmd_snapshot(args))
     if args.cmd == "emit":
         sys.exit(cmd_emit(args))
+    if args.cmd == "emit-cpp":
+        sys.exit(cmd_emit_cpp(args))
     if args.cmd == "selfcheck":
         sys.exit(cmd_selfcheck(args))
     if args.cmd == "bench":
