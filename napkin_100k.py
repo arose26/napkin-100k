@@ -975,7 +975,7 @@ def selfplay_episodes(net, device, games, eps, seed, opponent=None):
     import numpy as np
     import torch
 
-    transitions = []          # (state, action, reward, next_state, bootstrap_sign)
+    transitions = []   # (state, action, reward, next_state, next_mask, sign)
     results = {"win": 0, "loss": 0, "draw": 0}
     rng = random.Random(seed)
     B = min(256, games)
@@ -1002,7 +1002,8 @@ def selfplay_episodes(net, device, games, eps, seed, opponent=None):
         for i, g in enumerate(vec.games):
             if i in acts:
                 a = acts[i]
-                pending[i].append((x[i].copy(), a, g.current_player))
+                pending[i].append((x[i].copy(), mask[i].copy(), a,
+                                   g.current_player))
             else:
                 a = action_index(*opponent(g))
             g.play(*index_action(a))
@@ -1020,20 +1021,24 @@ def selfplay_episodes(net, device, games, eps, seed, opponent=None):
                 else:
                     results["loss"] += 1
             # credit every stored decision from ITS mover's point of view
-            for t, (st, act, mover) in enumerate(pending[i]):
+            for t, (st, _m, act, mover) in enumerate(pending[i]):
                 # DQN reward is IMMEDIATE: zero everywhere except the mover's
                 # last decision, which carries the outcome. Putting the outcome on
                 # every transition AND bootstrapping double-counts the return.
                 outcome = 0.0 if w == -1 else (1.0 if w == mover else -1.0)
-                r, nxt, sign = outcome, None, 1.0
+                r, nxt, nmask, sign = outcome, None, None, 1.0
                 if t + 1 < len(pending[i]):
                     r = 0.0
                     nxt = pending[i][t + 1][0]
-                    # bootstrap sign depends on WHOSE state comes next: in pure
-                    # self-play the next stored state is the opponent's (negate);
-                    # against a fixed opponent both stored states are ours (don't).
-                    sign = 1.0 if pending[i][t + 1][2] == mover else -1.0
-                transitions.append((st, act, r, nxt, sign))
+                    # the next state's LEGAL-move mask must travel with it: Q values
+                    # of illegal actions are never trained, so an unmasked max over
+                    # them bootstraps on free-drifting garbage and diverges.
+                    nmask = pending[i][t + 1][1]
+                    # sign depends on WHOSE state comes next: in pure self-play the
+                    # next stored state is the opponent's (negate); against a fixed
+                    # opponent both stored states are ours (don't).
+                    sign = 1.0 if pending[i][t + 1][3] == mover else -1.0
+                transitions.append((st, act, r, nxt, nmask, sign))
             pending[i] = []
             net_seat[i] = 1 - net_seat[i]
             if remaining > 0:
@@ -1081,10 +1086,13 @@ def cmd_train(args):
             tgt = rw.clone()
             if nxt_idx:
                 ns = torch.from_numpy(np.stack([batch[i][3] for i in nxt_idx])).to(device)
-                sg = torch.tensor([batch[i][4] for i in nxt_idx],
+                nm = torch.from_numpy(
+                    np.stack([batch[i][4] for i in nxt_idx])).to(device)
+                sg = torch.tensor([batch[i][5] for i in nxt_idx],
                                    device=device, dtype=torch.float32)
                 with torch.no_grad():
-                    nq = target(ns).max(dim=1).values
+                    # mask illegal actions (-1e9) before the max
+                    nq = (target(ns) + nm).max(dim=1).values
                 # sign carries whose turn the next state is (see selfplay_episodes)
                 tgt[nxt_idx] = rw[nxt_idx] + args.gamma * sg * nq
             loss = F.smooth_l1_loss(q, tgt)
@@ -1641,7 +1649,9 @@ def cmd_selfcheck(args):
     assert all(abs(t[2]) in (0.0, 1.0) for t in term), "bad terminal reward"
     assert any(abs(t[2]) == 1.0 for t in term), "no decisive game in sample"
     # pure self-play: the next stored state is always the opponent's -> sign -1
-    assert all(t[4] == -1.0 for t in nonterm), "self-play bootstrap sign should negate"
+    assert all(t[5] == -1.0 for t in nonterm), "self-play bootstrap sign should negate"
+    assert all(t[4] is not None and len(t[4]) == N_ACT for t in nonterm), \
+        "non-terminal transition is missing its next-state legal mask"
     assert all(len(t[0]) == N_IN for t in trs), "state width mismatch"
 
     print("selfcheck OK")
