@@ -146,8 +146,11 @@ Why, without excuses: this net picks its move by evaluating the current position
 no lookahead. Its opponent searches roughly eight plies. Ultimate Tic-Tac-Toe is sharply
 tactical, so a one-ply evaluator is playing a fundamentally different and much weaker
 game, and 128k self-play games is a small fraction of what a net needs to compensate.
-The parity between fp32 and int8 above also shows the deficit is *not* a quantisation
-artefact — the net simply is not strong enough yet.
+The parity between fp32 and int8 above shows the deficit is *not* a quantisation
+artefact. It does **not** show that 68,224 weights is enough capacity — precision and
+capacity are different constraints, and only the first has been measured. Whether a
+larger, over-budget net would close the gap is untested, and testing it is exactly the
+strength-versus-bytes curve this project set out to draw.
 
 **H3-2 — CONFIRMED.** int8 costs nothing measurable. Against `random` the packed net
 scored **+2.2 points** over fp32 and against `greedy` **+0.2** — both well inside their
