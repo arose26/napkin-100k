@@ -262,6 +262,29 @@ currently ranked #1 in Silver, and promotion only requires beating the Silver bo
 "promotes to Gold" is the claim, *not* "ranks well inside Gold" — a bottom-of-Gold
 finish would still confirm this hypothesis and should not be dressed up as more.
 
+### H6 — how far does a *scripted* bot go before a net is needed? (registered 2026-08-19,
+### before implementing)
+
+A deliberately honest question for the series: the whole premise of napkin-100k is that a
+**trained net** climbs this ladder. That premise is only interesting if a well-built
+hand-written search *cannot* trivially do the same. So repo 1 pushes the scripted
+baseline as hard as is reasonable, and registers where it expects to stall.
+
+`emit-cpp --version tuned` adds the standard alpha-beta machinery the straight port
+lacked: Zobrist **transposition table**, **negamax** with proper bounds, **move ordering**
+(TT move → immediate small-board win → block → killers → history), make/unmake instead of
+copying the position, and a **UTTT-aware eval** (master-cell positional weights, penalty
+for handing the opponent a free choice of board).
+
+**Registered predictions:**
+1. It beats the straight C++ port head-to-head at ≥ 70% over ≥ 40 games, both sides.
+2. It reaches **Gold** (this is the cheap part — the port was already eligible).
+3. It **does NOT reach Legend** (top 419). Legend is held by MCTS/NN authors; a
+   hand-tuned depth-limited alpha-beta with a linear eval should stall in Gold or the
+   bottom of Legend's neighbourhood. **If this prediction fails — if a scripted bot walks
+   into Legend — that is a genuine problem for the series premise and will be reported
+   as one, not buried.**
+
 **H5 result (2026-08-19):** submitted; in the CG sandbox it reaches **depth 7 / 456,704
 nodes** on the opening turn and 5 ply mid-game with no timeouts (the sandbox is ~1.6×
 slower than this laptop, consistent with the H3c measurement). It went straight to
