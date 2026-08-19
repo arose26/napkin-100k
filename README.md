@@ -282,6 +282,38 @@ quantisation, and they cost no measurable strength (H3-2).
 while it loses 0–60 to a baseline. Putting it on the public ladder now would measure
 nothing that this table has not already measured.
 
+### Deployed bot (2026-08-19)
+
+The net is live on the arena: **`out/net_search_bot.cpp`**, 98,626 bytes, 1,374 under the
+cap — the self-play-trained weights plus the search that uses them as its evaluation
+function. It compiles in the venue's sandbox, reaches depth 3 there inside the turn
+budget, and its own move generator reports zero disagreements with the referee's legal
+list. The account is in **Gold**.
+
+**This submission does not meet the gate I registered for it.** H5 said a bot goes to the
+arena only at ≥ 60% against `ab`; measured, this one is at **0.467**. It was deployed at
+the owner's explicit direction, and the reason is worth recording because it is not about
+strength: until now the account's ladder position was held by a *hand-written* alpha-beta.
+Replacing it means the bot on the public ladder is finally the thing this project is
+actually about. The registered gate stands as written and this is logged as an override,
+not as the gate being satisfied.
+
+**One robustness fix was needed first, and the correctness gate is what forced it.**
+`check-bot` caught the searching bot declining forced wins — which a negamax with exact
+terminal values must never do. It was not a search bug: the bot's internal position was
+verified against the referee every turn with zero drift, and on an idle machine it took
+10/10. It was the *time budget* — under CPU contention the clock expired before the search
+committed, and the bot fell back to an arbitrary move. Three fixes, in increasing order of
+how much they actually settle the matter: the fallback became the net's own highest-Q move
+rather than the first legal one; depth 1 was made unabortable; and finally an immediately
+winning move is now detected **exactly, before any search runs**, because a forced win is
+certain knowledge and should never be contingent on a clock. With that, **12/12 forced
+wins even while another process pinned a core.**
+
+The generalisable lesson, which also corrected one of my own numbers: **a time-budgeted
+bot must be benchmarked on an idle machine.** The first `ab` measurement read 0.417 while
+training competed for CPU; re-measured fairly it is 0.467.
+
 ### Training notes (kept because they cost real time)
 
 Two defects in the reinforcement-learning code, both of which produce a *quietly weak*
