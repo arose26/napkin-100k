@@ -285,8 +285,50 @@ for handing the opponent a free choice of board).
    into Legend — that is a genuine problem for the series premise and will be reported
    as one, not buried.**
 
-### H7 — MCTS, the algorithm this game actually rewards (registered 2026-08-19,
-### before implementing)
+**H6 results (2026-08-19). Prediction 1 FALSIFIED; 2 and 3 abandoned untested.**
+
+- **Prediction 1: falsified.** Tuned vs the straight port through the official referee,
+  both sides, 40 games: **24W – 14L – 2D = 62.5%**, against the registered ≥ 70%.
+  Depth went from 8 to 10 ply (1.0M → 10.9M nodes on the opening) and bought only ~12
+  points of win rate. The lesson is the useful part: **in UTTT, deeper search over a
+  hand-tuned linear eval has sharply diminishing returns** — the position is too tactical
+  for the eval to be right about, which is precisely why strong bots here are MCTS or
+  net-guided. That is a genuinely helpful signal for repo 2: a learned evaluation is not
+  a stylistic preference in this game, it is the thing that is actually missing.
+- **Predictions 2 and 3: abandoned untested.** The tuned bot was **never submitted to the
+  arena** (see H7's withdrawal above — the ladder is now reserved for the net). It stays
+  in this repo as an offline baseline only.
+- Verified anyway, since it is now a measuring stick: `check-cpp` drives it through this
+  repo's engine and confirms every move legal and **every forced win taken** across
+  sampled games.
+
+### H7 — WITHDRAWN BEFORE IMPLEMENTATION (2026-08-19)
+
+**Withdrawn, unimplemented, never submitted.** Registered hypotheses are not deleted in
+this series, so it stays on the record with the reason.
+
+The reason is a scope error, caught by Kole: **this series is about a self-play-trained
+neural net.** Scripted baselines exist here to *calibrate* the ladder — the design doc
+asks for exactly that — and that job was already finished when `ab-id` measured global
+1,804. Continuing to optimise a hand-written searcher (H6's tuned alpha-beta, then this
+MCTS) turned the baseline into the project, which it is not.
+
+**The concrete harm, which is worse than the wasted effort: league promotions are a
+one-way ratchet, and scripted bots have been spending them.** Every league a scripted bot
+climbs permanently raises the account's floor, and the net — arriving in repo 5 — can
+only ever start from that floor. Scripted code has already spent Wood → Bronze → Silver
+(→ Gold pending). An MCTS bot would plausibly have spent Gold → Legend too, consuming the
+exact climb the series exists to demonstrate. This is the **same sticky-league trap that
+killed H4**, walked into a second time.
+
+**Rule adopted for the rest of the series:** scripted baselines are measured
+**offline only**, head-to-head in this repo's verified engine. **The public ladder is
+reserved for the net.** The bar the net must clear is now a number, not a league:
+beat the measured baselines offline, and beat global rank 1,804.
+
+The withdrawn text follows, unedited, for the record.
+
+### H7 (withdrawn) — MCTS, the algorithm this game actually rewards
 
 Early H6 head-to-head numbers came in around 63%, under the 70% I registered — deeper
 search with a hand-tuned linear eval bought less than expected. That is itself the
