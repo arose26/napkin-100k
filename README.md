@@ -79,9 +79,12 @@ baselines run sequentially, each archived after rank stabilizes:
   bottom half of its division.
 - **greedy (1-ply)**: clears plain-3×3 Wood bosses (1-ply suffices to never lose plain
   TTT against imperfect play), promotes to Bronze, lands in Bronze's **bottom third**.
-- **ab-6 (alpha-beta, depth 6, simple eval)**: promotes out of Bronze; registered:
-  **Silver division, middle third**, and does NOT reach the top league (the top is
-  MCTS/NN territory; fixed-depth minimax with a naive eval should stall below it).
+- **ab-id (iterative-deepening alpha-beta, 90 ms budget, simple documented eval,
+  Python)**: promotes out of Bronze; registered: **Silver division, middle third**, and
+  does NOT reach the top league (the top is MCTS/NN territory; shallow minimax with a
+  naive eval should stall below it). *(Amended pre-results from "depth 6" to
+  time-budgeted: fixed depth 6 isn't reliably reachable in interpreted Python inside
+  100 ms, and the baseline's job is calibration under the real turn budget.)*
 
 H4 is the riskiest registration (a deliberate feature: if the mapping surprises us,
 that's information — it recalibrates what self-play Elo must reach before the campaign).
@@ -93,5 +96,14 @@ implementations.
 
 ## Results
 
-*(none yet — this section fills in below this line only after the hypotheses above were
-committed. Chronology is the whole point.)*
+*(fills in below this line only after the hypotheses above were committed.
+Chronology is the whole point.)*
+
+**H2 — blind-reimplementation parity: CONFIRMED (2026-08-19).** A second engine was
+written by an agent from the extracted rules text alone (`blind_engine.py`, kept in this
+repo as the verification artifact; it never saw `napkin_referee.py`). Seeded random-game
+fuzz, comparing valid-action *sets* every ply and outcome every game:
+level 2 — 25,000 games, **1,472,677 plies, 0 divergences**;
+level 1 — 2,000 games, 15,269 plies, 0 divergences.
+Repro: `python3 napkin_referee.py fuzz --other blind_engine.py --level 2 --games 25000 --seed 12`
+(and `--level 1 --games 2000 --seed 11`).
