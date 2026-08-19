@@ -261,3 +261,11 @@ currently ranked #1 in Silver, and promotion only requires beating the Silver bo
 **Registered risk:** Gold holds 1,385 bots and is where real MCTS implementations start;
 "promotes to Gold" is the claim, *not* "ranks well inside Gold" — a bottom-of-Gold
 finish would still confirm this hypothesis and should not be dressed up as more.
+
+**H5 result (2026-08-19):** submitted; in the CG sandbox it reaches **depth 7 / 456,704
+nodes** on the opening turn and 5 ply mid-game with no timeouts (the sandbox is ~1.6×
+slower than this laptop, consistent with the H3c measurement). It went straight to
+**rank 1 of its Silver room** and the arena flipped `eligibleForPromotion: true`, which
+is CodinGame's precondition for moving up — promotion itself lands on the league's
+periodic cycle. **Final league recorded below once the cycle fires; "eligible" is not
+"promoted" and is not being counted as the result.**
