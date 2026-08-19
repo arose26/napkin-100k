@@ -314,6 +314,26 @@ The generalisable lesson, which also corrected one of my own numbers: **a time-b
 bot must be benchmarked on an idle machine.** The first `ab` measurement read 0.417 while
 training competed for CPU; re-measured fairly it is 0.467.
 
+### Where the compute actually goes (measured 2026-08-19)
+
+The obvious response to "the value head needs more training" is to rent a GPU. Measured,
+that is the wrong lever for this code:
+
+| machine | 5 AlphaZero iterations |
+|---|---|
+| this laptop (RTX 4050, 6 GB) | 105 s |
+| Colab **Tesla T4**, 2 vCPU | **117 s** |
+
+The T4 is *slower*, because nothing that matters is on the GPU. Self-play spends its time
+in the Python engine and the per-node MCTS bookkeeping, and Colab supplies only 2 vCPUs
+for that. The network forward passes — the only GPU work — are a rounding error beside it.
+
+So the real unlock is not a bigger GPU but **moving self-play onto it**: a tensorised
+engine where thousands of games advance as batched bitmask operations, with the tree
+search batched alongside. That is the difference between a T4 idling behind two Python
+threads and a T4 actually generating training data. Recording it as the identified next
+step rather than guessing at hyperparameters.
+
 ### Training notes (kept because they cost real time)
 
 Two defects in the reinforcement-learning code, both of which produce a *quietly weak*
