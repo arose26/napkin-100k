@@ -98,6 +98,28 @@ the extracted rules alone and never shown our engine's source, will agree with i
 offline, the honest headline of this project is "a hand-written search beat our net
 inside the same 100KB" — and that is what will be written.
 
+**H4 — is lookahead the missing ingredient?** (registered before implementing)
+
+H3 diagnosed the 0–60 loss as *absence of search*, not weak weights. That diagnosis is
+cheap to test directly: take **the same trained net, unchanged**, and use it as the leaf
+evaluator inside a negamax search instead of picking its argmax move. Nothing is
+retrained; the only variable is lookahead.
+
+**Registered prediction:** the same net, searched to depth 3, beats `ab` at > 50%.
+If lookahead is really the deficit, this closes most of a 0–60 gap. If it does not,
+my diagnosis was wrong and the problem lies in the learned evaluation itself.
+
+**H5 — the AlphaZero loop** (registered before implementing). Replace DQN-with-argmax
+with the arrangement this game actually rewards: a policy+value network guiding an MCTS,
+trained on **search-improved targets** — the search's visit distribution becomes the
+policy target, the game outcome becomes the value target, and the improved policy feeds
+the next round of self-play. The net supplies all learned knowledge; the search carries
+no hand-tuned evaluation. Sized to the same measured budget.
+
+**Registered predictions:** (1) it beats `ab` offline at ≥ 60%, both seats; (2) it packs
+under 100,000 bytes *including* the MCTS harness; (3) only if (1) and (2) hold does it go
+to the public arena — a bot that loses to a baseline is not worth a submission.
+
 ## Results
 
 **H1 — CONFIRMED.** Against the official Java referee, driven headlessly with our engine
