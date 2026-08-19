@@ -161,10 +161,17 @@ Nothing was retrained. The only change is lookahead, and it moves the net from l
 every single game against `ab` to roughly even with it. The H3 diagnosis was right:
 **what the net was missing is search, not weights.**
 
-Stated carefully, because the registered prediction was "> 50%": the point estimate
-0.525 clears it, but the interval spans parity, so the honest reading is *the net with
-search is now competitive with `ab`, not demonstrably better than it*. A larger run is
-under way to tighten that interval.
+**The registered prediction is NOT met.** It said "beats `ab` at > 50%". A larger
+120-game run returned **exactly 60W–60L, score 0.500** [0.412, 0.588]; pooled with the
+first 40 games that is **81W–79L over 160 games = 0.506** [0.430, 0.583]. This is a dead
+heat, not a win. The prediction as written is unsupported and is recorded as such.
+
+What *is* strongly supported is the diagnosis behind it: adding lookahead moved the same
+weights from **0.000 to 0.506** against the same opponent. The deficit H3 exposed was
+search, and search alone recovers all of it — up to parity with the alpha-beta, and no
+further. That ceiling is itself informative: a net trained by DQN to pick moves is not
+also a good *evaluation function*, which is precisely the gap the AlphaZero loop (H5)
+attacks by training the value head on game outcomes and the policy head on search.
 
 **H3 — the net: 1 FALSIFIED, 2 CONFIRMED, 3 FALSIFIED (threshold was wrong), 4 not
 attempted.** 500 iterations of self-play (≈128,000 games) on one laptop GPU, ~34 minutes.
