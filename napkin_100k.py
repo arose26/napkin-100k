@@ -1586,6 +1586,37 @@ def cmd_selfcheck(args):
         "non-terminal transition is missing its next-state legal mask"
     assert all(len(t[0]) == N_IN for t in trs), "state width mismatch"
 
+    # MCTS: with an UNTRAINED net the value head is noise, so only the exact
+    # terminal values can carry the search. If it still finds every forced win,
+    # the tree, the terminal handling and the backup SIGN are all correct --
+    # a flipped sign would make it actively avoid winning.
+    torch.manual_seed(0)
+    _az = build_aznet("cpu")
+    _az.eval()
+    _mcts = MCTS(_az, "cpu", sims=48, seed=3)
+    _rng = random.Random(9)
+    _offered = _taken = 0
+    for _g in range(6):
+        e = Engine(2)
+        while not e.game_over and _offered < 12:
+            va = sorted(e.valid_actions())
+            me = e.current_player
+            st = e.get_state()
+            wins = []
+            for a in va:
+                e.play(*a)
+                if e.game_over and e.winner == me:
+                    wins.append(a)
+                e.set_state(st)
+            if wins:
+                pi = _mcts.run([e])[0]
+                _offered += 1
+                if max(pi, key=pi.get) in wins:
+                    _taken += 1
+            e.play(*_rng.choice(va))
+    assert _offered == 0 or _taken == _offered, \
+        f"MCTS declined a forced win ({_taken}/{_offered}) - check backup sign"
+
     print("selfcheck OK")
     return 0
 
