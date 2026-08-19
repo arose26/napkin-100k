@@ -1097,6 +1097,7 @@ def cmd_check_cpp(args):
       2. if a move exists that wins the master board outright, it plays one.
     (2) is the sharp one: a sign error in a negamax mate score shows up here as a
     bot that walks past forced wins, which strength testing alone can hide."""
+    import shutil
     import subprocess
     import tempfile
     import os
@@ -1147,6 +1148,8 @@ def cmd_check_cpp(args):
                 eng.play(*mv)
         finally:
             proc.kill()
+            proc.wait()
+    shutil.rmtree(tmp, ignore_errors=True)
     print(f"check-cpp ({args.version}) OK: {args.games} games, all moves legal, "
           f"{wins_taken}/{wins_offered} forced wins taken")
     return 0
