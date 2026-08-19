@@ -1090,6 +1090,68 @@ int main() {
 '''
 
 
+def cmd_check_cpp(args):
+    """Compile an emitted C++ bot and drive it through the CG protocol using THIS
+    file's verified engine as the referee. Asserts, every turn:
+      1. the move it returns is legal;
+      2. if a move exists that wins the master board outright, it plays one.
+    (2) is the sharp one: a sign error in a negamax mate score shows up here as a
+    bot that walks past forced wins, which strength testing alone can hide."""
+    import subprocess
+    import tempfile
+    import os
+
+    src = AB2_CPP if args.version == "tuned" else AB_CPP
+    tmp = tempfile.mkdtemp()
+    cpp, exe = os.path.join(tmp, "b.cpp"), os.path.join(tmp, "b")
+    with open(cpp, "w") as f:
+        f.write(src)
+    subprocess.run(["g++", "-O2", "-o", exe, cpp], check=True)
+
+    rng = random.Random(args.seed)
+    wins_taken = wins_offered = 0
+    for game in range(args.games):
+        bot_idx = game % 2
+        eng = Engine(2)
+        proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        try:
+            while not eng.game_over:
+                if eng.current_player != bot_idx:
+                    eng.play(*rng.choice(sorted(eng.valid_actions())))
+                    continue
+                va = sorted(eng.valid_actions())
+                # which legal moves win the whole game right now?
+                st = eng.get_state()
+                winning = []
+                for a in va:
+                    eng.play(*a)
+                    if eng.game_over and eng.winner == bot_idx:
+                        winning.append(a)
+                    eng.set_state(st)
+                last = eng.last if eng.last is not None else (-1, -1)
+                proc.stdin.write(f"{last[0]} {last[1]}\n{len(va)}\n")
+                for a in va:
+                    proc.stdin.write(f"{a[0]} {a[1]}\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                if not line:
+                    raise AssertionError("bot died mid-game")
+                mv = tuple(int(x) for x in line.split())
+                assert mv in eng.valid_actions(), f"ILLEGAL move {mv}, legal={va}"
+                if winning:
+                    wins_offered += 1
+                    assert mv in winning, (
+                        f"bot declined a forced win: played {mv}, wins were {winning}")
+                    wins_taken += 1
+                eng.play(*mv)
+        finally:
+            proc.kill()
+    print(f"check-cpp ({args.version}) OK: {args.games} games, all moves legal, "
+          f"{wins_taken}/{wins_offered} forced wins taken")
+    return 0
+
+
 def cmd_emit_cpp(args):
     src = AB2_CPP if args.version == "tuned" else AB_CPP
     sys.stdout.write(src)
@@ -1290,6 +1352,10 @@ def main():
     c.add_argument("--budget-ms", type=int, default=90)
     p = sub.add_parser("probe")
     p.add_argument("--utf16-blob", action="store_true")
+    cc = sub.add_parser("check-cpp")
+    cc.add_argument("--version", choices=("port", "tuned"), default="tuned")
+    cc.add_argument("--games", type=int, default=4)
+    cc.add_argument("--seed", type=int, default=3)
     ec = sub.add_parser("emit-cpp")
     ec.add_argument("--version", choices=("port", "tuned"), default="tuned")
     e = sub.add_parser("emit")
@@ -1310,6 +1376,8 @@ def main():
         sys.exit(cmd_emit(args))
     if args.cmd == "emit-cpp":
         sys.exit(cmd_emit_cpp(args))
+    if args.cmd == "check-cpp":
+        sys.exit(cmd_check_cpp(args))
     if args.cmd == "selfcheck":
         sys.exit(cmd_selfcheck(args))
     if args.cmd == "bench":
