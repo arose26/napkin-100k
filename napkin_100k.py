@@ -1175,6 +1175,24 @@ def cmd_selfcheck(args):
     assert sum(pl[162:243]) == 8  # 8 legal replies in the center board
     assert action_index(*index_action(80)) == 80
 
+    # base85 round-trip: the packer's encoder and the C++ decoder must agree on
+    # every byte value, including the signed-int8 edges. A single-byte slip here
+    # silently corrupts weights and shows up only as a mysteriously weak bot.
+    import os as _os
+    probe = bytes(range(256)) + _os.urandom(997)
+    assert b85_decode(b85_encode(probe), len(probe)) == probe, "base85 round-trip"
+    assert len(b85_encode(b"\x00\x00\x00\x00")) == 5, "base85 should be 4->5"
+
+    # int8 quantisation: scale must survive the round trip within one step
+    try:
+        import numpy as _np
+        w = _np.array([-1.0, -0.5, 0.0, 0.25, 1.0], dtype=_np.float32)
+        q, sc = quantize_int8(w)
+        assert abs(float(q.max()) * sc - 1.0) < 1e-6, "quantise scale wrong"
+        assert _np.abs(q.astype(_np.float32) * sc - w).max() <= sc, "quantise error > 1 step"
+    except ImportError:
+        pass
+
     # Transition builder: the RL bug that hides best. Play one fixed game and
     # assert the shape of what training will consume.
     class _FixedNet:
