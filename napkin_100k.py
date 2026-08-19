@@ -1021,9 +1021,13 @@ def selfplay_episodes(net, device, games, eps, seed, opponent=None):
                     results["loss"] += 1
             # credit every stored decision from ITS mover's point of view
             for t, (st, act, mover) in enumerate(pending[i]):
-                r = 0.0 if w == -1 else (1.0 if w == mover else -1.0)
-                nxt, sign = None, 1.0
+                # DQN reward is IMMEDIATE: zero everywhere except the mover's
+                # last decision, which carries the outcome. Putting the outcome on
+                # every transition AND bootstrapping double-counts the return.
+                outcome = 0.0 if w == -1 else (1.0 if w == mover else -1.0)
+                r, nxt, sign = outcome, None, 1.0
                 if t + 1 < len(pending[i]):
+                    r = 0.0
                     nxt = pending[i][t + 1][0]
                     # bootstrap sign depends on WHOSE state comes next: in pure
                     # self-play the next stored state is the opponent's (negate);
@@ -1139,6 +1143,269 @@ def evaluate_net(net, device, games, seed):
         n = res["win"] + res["loss"] + res["draw"]
         out[name] = (res["win"] + 0.5 * res["draw"]) / max(1, n)
     return out
+
+
+# == the packer: torch checkpoint -> one self-contained C++ source =============
+# "One file that writes one file." Weights are per-tensor symmetrically quantised
+# to int8, emitted as base85 text (4 bytes -> 5 chars), and read back by a
+# hand-rolled forward pass. No libraries exist inside a CodinGame submission.
+
+NET_CPP_TEMPLATE = r"""/* napkin-100k: a self-play-trained net, weights and all, in one file.
+ * Disclosed bot - github.com/arose26/napkin-100k, account Napkin100k.
+ * Net: %(shape)s, int8 weights decoded from base85 below.
+ * CG compiles at -O0 by default, hence the pragma. */
+#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+static const int N_IN = %(n_in)d, N_H1 = %(n_h1)d, N_H2 = %(n_h2)d, N_ACT = %(n_act)d;
+static const float S1 = %(s1).9gf, S2 = %(s2).9gf, S3 = %(s3).9gf;
+static const char* W85 =
+%(w85)s;
+static const float B1[] = {%(b1)s};
+static const float B2[] = {%(b2)s};
+static const float B3[] = {%(b3)s};
+
+static int8_t W[%(nw)d];
+
+/* base85 (RFC1924 alphabet, 5 chars -> 4 bytes), matching the Python emitter */
+static void decodeWeights() {
+    static const char* A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                           "abcdefghijklmnopqrstuvwxyz!#$%%&()*+-;<=>?@^_`{|}~";
+    int inv[256]; for (int i = 0; i < 256; i++) inv[i] = -1;
+    for (int i = 0; i < 85; i++) inv[(unsigned char)A[i]] = i;
+    size_t n = strlen(W85); size_t out = 0;
+    for (size_t i = 0; i + 4 < n; i += 5) {
+        uint32_t v = 0;
+        for (int k = 0; k < 5; k++) v = v * 85u + (uint32_t)inv[(unsigned char)W85[i+k]];
+        for (int k = 3; k >= 0; k--) {
+            if (out + (size_t)k < (size_t)%(nw)d) W[out + k] = (int8_t)((v >> (8 * (3 - k))) & 0xFF);
+        }
+        out += 4;
+    }
+}
+
+static float h1[N_H1], h2[N_H2], qout[N_ACT];
+
+static void forward(const float* x) {
+    const int8_t* w = W;
+    for (int j = 0; j < N_H1; j++) {
+        float a = 0.f;
+        for (int i = 0; i < N_IN; i++) a += x[i] * (float)w[j * N_IN + i];
+        a = a * S1 + B1[j];
+        h1[j] = a > 0.f ? a : 0.f;
+    }
+    w += N_IN * N_H1;
+    for (int j = 0; j < N_H2; j++) {
+        float a = 0.f;
+        for (int i = 0; i < N_H1; i++) a += h1[i] * (float)w[j * N_H1 + i];
+        a = a * S2 + B2[j];
+        h2[j] = a > 0.f ? a : 0.f;
+    }
+    w += N_H1 * N_H2;
+    for (int j = 0; j < N_ACT; j++) {
+        float a = 0.f;
+        for (int i = 0; i < N_H2; i++) a += h2[i] * (float)w[j * N_H2 + i];
+        qout[j] = a * S3 + B3[j];
+    }
+}
+
+/* ---- game state, mirroring the verified Python engine's encoder ---- */
+static const uint16_t WINM[8] = {0700,070,07,0444,0222,0111,0421,0124};
+static bool winsMask(uint16_t m){for(int i=0;i<8;i++) if((m&WINM[i])==WINM[i]) return true; return false;}
+static uint16_t bd[2][9]; static uint16_t owned[2]; static uint16_t drawnM;
+
+static void applyMove(int r,int c,int p){
+    int b=(r/3)*3+c/3, i=(r%%3)*3+(c%%3);
+    bd[p][b]|=(uint16_t)(1<<i);
+    if(winsMask(bd[p][b])) owned[p]|=(uint16_t)(1<<b);
+    else if((bd[0][b]|bd[1][b])==0777) drawnM|=(uint16_t)(1<<b);
+}
+
+/* encode_planes(): [mine | theirs | legal | owned_diff], 4 x 81 */
+static float feat[4*81];
+static void encode(int me,const int* legalCells,int nLegal){
+    memset(feat,0,sizeof(feat));
+    int opp=1-me;
+    for(int r=0;r<9;r++)for(int c=0;c<9;c++){
+        int b=(r/3)*3+c/3, i=(r%%3)*3+(c%%3), idx=r*9+c;
+        feat[idx]        = (float)((bd[me][b]>>i)&1);
+        feat[81+idx]     = (float)((bd[opp][b]>>i)&1);
+        feat[243+idx]    = (float)(((owned[me]>>b)&1) - ((owned[opp]>>b)&1));
+    }
+    for(int k=0;k<nLegal;k++) feat[162+legalCells[k]] = 1.f;
+}
+
+int main(){
+    decodeWeights();
+    int me=-1;
+    while(true){
+        int orow,ocol;
+        if(scanf("%%d%%d",&orow,&ocol)!=2) return 0;
+        if(orow<-1||orow>8||ocol<-1||ocol>8) return 1;
+        if(me<0) me = (orow==-1)?0:1;
+        if(orow>=0&&ocol>=0) applyMove(orow,ocol,1-me);
+        int n; if(scanf("%%d",&n)!=1||n<1||n>81) return 1;
+        int cells[81];
+        for(int i=0;i<n;i++){int r,c; if(scanf("%%d%%d",&r,&c)!=2) return 1;
+            if(r<0||r>8||c<0||c>8) return 1; cells[i]=r*9+c;}
+        encode(me,cells,n);
+        forward(feat);
+        int best=cells[0]; float bv=-1e30f;
+        for(int i=0;i<n;i++){ if(qout[cells[i]]>bv){bv=qout[cells[i]];best=cells[i];} }
+        applyMove(best/9,best%%9,me);
+        printf("%%d %%d\n",best/9,best%%9);
+        fflush(stdout);
+    }
+}
+"""
+
+B85_ALPHABET = ("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~")
+
+
+def b85_encode(data: bytes) -> str:
+    """RFC1924-style base85; 4 bytes -> 5 chars. Pads the tail with zeros."""
+    out = []
+    pad = (-len(data)) % 4
+    data = data + b"\x00" * pad
+    for i in range(0, len(data), 4):
+        v = int.from_bytes(data[i:i + 4], "big")
+        chunk = []
+        for _ in range(5):
+            v, rem = divmod(v, 85)
+            chunk.append(B85_ALPHABET[rem])
+        out.append("".join(reversed(chunk)))
+    return "".join(out)
+
+
+def b85_decode(text: str, n: int) -> bytes:
+    out = bytearray()
+    inv = {c: i for i, c in enumerate(B85_ALPHABET)}
+    for i in range(0, len(text) - 4, 5):
+        v = 0
+        for k in range(5):
+            v = v * 85 + inv[text[i + k]]
+        out.extend(v.to_bytes(4, "big"))
+    return bytes(out[:n])
+
+
+def quantize_int8(w):
+    """Per-tensor symmetric quantisation. Returns (int8 array, scale)."""
+    import numpy as np
+    s = float(np.abs(w).max()) / 127.0
+    if s == 0:
+        s = 1e-8
+    q = np.clip(np.rint(w / s), -127, 127).astype(np.int8)
+    return q, s
+
+
+def cmd_pack(args):
+    import numpy as np
+    import torch
+
+    ck = torch.load(args.net, map_location="cpu")
+    sd = ck["state_dict"]
+    n_in, n_h1, n_h2, n_act = ck["shape"]
+    # Linear stores weight as (out, in); the C++ reads it row-major the same way.
+    w1, b1 = sd["0.weight"].numpy(), sd["0.bias"].numpy()
+    w2, b2 = sd["2.weight"].numpy(), sd["2.bias"].numpy()
+    w3, b3 = sd["4.weight"].numpy(), sd["4.bias"].numpy()
+    q1, s1 = quantize_int8(w1)
+    q2, s2 = quantize_int8(w2)
+    q3, s3 = quantize_int8(w3)
+    blob = q1.tobytes() + q2.tobytes() + q3.tobytes()
+    txt = b85_encode(blob)
+    # split into C string literal chunks so the line length stays sane
+    chunks = [txt[i:i + 100] for i in range(0, len(txt), 100)]
+    w85 = "\n".join(f'  "{c}"' for c in chunks)
+    fmt = lambda a: ",".join(f"{float(v):.6g}f" for v in a)
+    src = NET_CPP_TEMPLATE % {
+        "shape": f"{n_in}-{n_h1}-{n_h2}-{n_act}",
+        "n_in": n_in, "n_h1": n_h1, "n_h2": n_h2, "n_act": n_act,
+        "s1": s1, "s2": s2, "s3": s3, "w85": w85, "nw": len(blob),
+        "b1": fmt(b1), "b2": fmt(b2), "b3": fmt(b3),
+    }
+    with open(args.out, "w") as f:
+        f.write(src)
+    n = len(src.encode("utf-8"))
+    print(f"packed {args.net} -> {args.out}: {n} UTF-8 bytes "
+          f"({100000 - n} under the measured cap), {len(blob)} int8 weights")
+    if n > 100000:
+        print("OVER THE CAP - this source would be rejected by the venue")
+        return 1
+    return 0
+
+
+def cmd_check_net(args):
+    """H8-3: does the emitted C++ pick the same move as the torch net?
+
+    Drives the compiled bot and the torch net through identical random legal
+    positions via the CG protocol, comparing argmax over legal moves. A packer
+    that silently changes the policy invalidates every downstream ladder claim,
+    so this is the gate before any submission."""
+    import numpy as np
+    import shutil
+    import subprocess
+    import tempfile
+    import os
+    import torch
+
+    ck = torch.load(args.net, map_location="cpu")
+    net = build_net("cpu")
+    net.load_state_dict(ck["state_dict"])
+    net.eval()
+
+    tmp = tempfile.mkdtemp()
+    exe = os.path.join(tmp, "bot")
+    subprocess.run(["g++", "-O2", "-o", exe, args.cpp], check=True)
+
+    rng = random.Random(args.seed)
+    agree = total = 0
+    disagreements = []
+    for game in range(args.games):
+        bot_seat = game % 2
+        eng = Engine(2)
+        proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        try:
+            while not eng.game_over:
+                if eng.current_player != bot_seat:
+                    eng.play(*rng.choice(sorted(eng.valid_actions())))
+                    continue
+                va = sorted(eng.valid_actions())
+                last = eng.last if eng.last is not None else (-1, -1)
+                proc.stdin.write(f"{last[0]} {last[1]}\n{len(va)}\n")
+                for a in va:
+                    proc.stdin.write(f"{a[0]} {a[1]}\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                if not line:
+                    raise AssertionError("packed bot died")
+                cpp_mv = tuple(int(v) for v in line.split())
+                assert cpp_mv in eng.valid_actions(), f"packed bot played illegal {cpp_mv}"
+                x = np.asarray(encode_planes(eng, eng.current_player), dtype=np.float32)
+                with torch.no_grad():
+                    q = net(torch.from_numpy(x[None])).numpy()[0]
+                torch_mv = max(va, key=lambda a: q[action_index(*a)])
+                total += 1
+                if cpp_mv == torch_mv:
+                    agree += 1
+                elif len(disagreements) < 5:
+                    gap = abs(q[action_index(*cpp_mv)] - q[action_index(*torch_mv)])
+                    disagreements.append((cpp_mv, torch_mv, gap))
+                eng.play(*cpp_mv)
+        finally:
+            proc.kill()
+            proc.wait()
+    shutil.rmtree(tmp, ignore_errors=True)
+    pct = 100.0 * agree / max(1, total)
+    print(f"check-net: {agree}/{total} decisions match torch ({pct:.2f}%)")
+    for c, t, g in disagreements:
+        print(f"  cpp {c} vs torch {t}, |dQ| = {g:.5f}")
+    return 0 if pct >= args.min_agree else 1
 
 
 # -- ladder snapshot (platform-evidence habit, carried from series 2) ----------
@@ -1271,6 +1538,31 @@ def cmd_selfcheck(args):
     assert len(bot.encode("utf-8")) < 100000
     compile(bot, "emitted_bot", "exec")  # must at least parse
 
+    # Transition builder: the RL bug that hides best. Play one fixed game and
+    # assert the shape of what training will consume.
+    class _FixedNet:
+        def __call__(self, t):
+            import torch as _t
+            return _t.zeros((t.shape[0], N_ACT))
+        def __enter__(self): return self
+    try:
+        import torch  # noqa: F401
+        import numpy  # noqa: F401
+    except Exception:
+        print("selfcheck OK (torch absent: RL asserts skipped)")
+        return 0
+    trs, _ = selfplay_episodes(_FixedNet(), "cpu", 4, 1.0, 11)
+    assert trs, "no transitions produced"
+    nonterm = [t for t in trs if t[3] is not None]
+    term = [t for t in trs if t[3] is None]
+    # immediate reward is zero except on a mover's final decision
+    assert all(t[2] == 0.0 for t in nonterm), "non-terminal transition carries reward"
+    assert all(abs(t[2]) in (0.0, 1.0) for t in term), "bad terminal reward"
+    assert any(abs(t[2]) == 1.0 for t in term), "no decisive game in sample"
+    # pure self-play: the next stored state is always the opponent's -> sign -1
+    assert all(t[4] == -1.0 for t in nonterm), "self-play bootstrap sign should negate"
+    assert all(len(t[0]) == N_IN for t in trs), "state width mismatch"
+
     print("selfcheck OK")
     return 0
 
@@ -1300,6 +1592,15 @@ def main():
     c.add_argument("--budget-ms", type=int, default=90)
     p = sub.add_parser("probe")
     p.add_argument("--utf16-blob", action="store_true")
+    cn = sub.add_parser("check-net")
+    cn.add_argument("--net", default="out/net.pt")
+    cn.add_argument("--cpp", default="out/net_bot.cpp")
+    cn.add_argument("--games", type=int, default=10)
+    cn.add_argument("--seed", type=int, default=5)
+    cn.add_argument("--min-agree", type=float, default=99.9)
+    pk = sub.add_parser("pack")
+    pk.add_argument("--net", default="out/net.pt")
+    pk.add_argument("--out", default="out/net_bot.cpp")
     tr = sub.add_parser("train")
     tr.add_argument("--iters", type=int, default=200)
     tr.add_argument("--games-per-iter", type=int, default=256)
@@ -1341,6 +1642,10 @@ def main():
         sys.exit(cmd_emit(args))
     if args.cmd == "emit-cpp":
         sys.exit(cmd_emit_cpp(args))
+    if args.cmd == "check-net":
+        sys.exit(cmd_check_net(args))
+    if args.cmd == "pack":
+        sys.exit(cmd_pack(args))
     if args.cmd == "train":
         sys.exit(cmd_train(args))
     if args.cmd == "check-cpp":

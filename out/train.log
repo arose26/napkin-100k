@@ -1,0 +1,2 @@
+iter 20/400 eps 0.82 buf 297463 loss 0.5165 vs-random 0.598 vs-greedy 0.137 (44s)
+iter 40/400 eps 0.75 buf 400000 loss 0.7049 vs-random 0.600 vs-greedy 0.150 (116s)
