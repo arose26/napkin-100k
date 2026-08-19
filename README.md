@@ -1,49 +1,54 @@
-# napkin-referee
+# napkin-100k
 
-Repo 1 of the **napkin-100k series** (this → napkin-selfplay → napkin-shrink →
-napkin-forge → napkin-100k). The series question: how much playing strength fits in a
-single ≤100k-character CodinGame source file, trained by self-play, deployed honestly on
-a live public ladder? This repo builds **the world**: an exact offline replica of the
-chosen game, verified bit-level against the venue's own referee — because every later
-claim ("Elo in the sim", "strength per kilobyte") inherits its meaning from this parity.
+**The whole series in one repo.** Train a neural network by self-play on a laptop,
+squeeze it — weights and all — into a single CodinGame source file under the venue's
+hard **100,000-byte** cap, and see how far it climbs a live public ladder of
+**10,070 bots**, where the top ranks are held by the scene's best bot engineers.
 
-**The game (registered choice, 2026-08-19):** Ultimate Tic-Tac-Toe, CodinGame arena
-`tic-tac-toe` — 10,069 ranked bots at selection time, the largest board-game ladder on
-the platform, official referee source public, famously an MCTS/NN playground with the
-scene's strong names at the top (karliso, RoboStac, TomAlard). Backup if UTTT fails
-in some unforeseen way: `othello-1`. Finale stretch target: Mad Pod Racing.
+The game is [Ultimate Tic-Tac-Toe](https://www.codingame.com/multiplayer/bot-programming/tic-tac-toe)
+on CodinGame. The account is [Napkin100k](https://www.codingame.com/profile/22639068dad6ecdf6717bb383d739a954432057),
+disclosed in its profile bio. One account, arena ladders only, never timed contests.
 
-Rules were extracted from the official referee source
-([CodinGame/game-ultimate-tictactoe](https://github.com/CodinGame/game-ultimate-tictactoe),
-Java, read 2026-08-19), not from folklore. Three details folklore tends to miss, all
-load-bearing: the valid-action list the referee sends is **shuffled** per game seed
-(order carries no information; parity compares sets); a master-board 3-in-a-row sets the
-mover's score to 10, which **dominates** any small-board count (max 9); drawn small
-boards mark **nobody's** master cell, so games can end with no master line — then most
-small boards won wins, equal counts draw. Wood leagues play plain 3×3 (referee "level
-1"); the real game (level 2) starts at promotion out of Wood.
-
-**Account:** one, disclosed — [Napkin100k](https://www.codingame.com/profile) (Kole's).
-No alt accounts (staff-stated rule + series rule). Arena ladders only, never timed
-contests (their "no technical assistance" clause is the one place the rules and this
-project's assisted development collide — registered constraint, doc §fine-print 3).
+House rules, unchanged from series 1/2: **one file**; hypotheses registered in this
+README *before* results; ≥5–10 seeds with IQM and bootstrap CIs wherever variance
+exists; ties reported as ties; honest nulls welcome; selfchecks written as
+independently-coded second implementations.
 
 ## What lives here
 
-One file, `napkin_referee.py`:
+`napkin_100k.py` — one file, four jobs:
 
-- **Engine** — exact replica of both referee levels (plain + ultimate), bitboard-based.
-- **Encoders** — state→planes and action↔index mappings the later repos will consume.
-- **Scripted baselines** — `random`, `greedy` (1-ply, documented), `ab-k` (alpha-beta
-  depth k, simple documented eval). These are the sim→ladder calibration instruments.
-- **Fuzz harnesses** — engine-vs-blind-reimplementation and engine-vs-official-Java-referee
-  parity over seeded random games.
-- **CG protocol adapter** — plays any built-in policy over CodinGame's stdin/stdout
-  protocol; in live play it recomputes the valid-action set each turn and logs any
-  mismatch with what the referee actually sent (venue parity checked on every real
-  ladder game, not just offline).
-- **Probe emitter** — prints the C++ probe bot used to measure the sandbox (a preview
-  of napkin-forge's file-that-writes-a-file trick).
+1. **The world.** An exact replica of CodinGame's referee, verified bit-level against
+   the venue's own Java engine (H1/H2 below). Every later claim inherits its meaning
+   from this parity, so it is checked first and hardest.
+2. **The net.** A self-play Q-network (324→128→128→81, 68,224 weights) trained with the
+   recipe carried from series 1/2 — replay buffer, target net, league of past selves —
+   and sized so that int8 + base85 lands inside the measured byte budget.
+3. **The baselines.** `random`, `greedy`, `ab` — scripted opponents used to *measure*
+   the net offline, plus the ladder calibration they already provided.
+4. **The packer.** Emits a single self-contained C++ source with hand-rolled inference.
+
+## The measured budget (this is the whole design constraint)
+
+    100,000 bytes  total source cap        (measured, see H3a - not the 100k
+                                            "UTF-16 characters" the community believes)
+    - ~6,000       C++ inference harness
+    ------------
+      ~94,000      for weights
+      / 1.25       base85 chars per int8 weight
+    ------------
+      ~75,000      weights available;  the net uses 68,224
+
+Time never binds: an 18k-parameter int8 net evaluates in **7.478 µs** inside the CG
+sandbox (H3c), so a 100 ms turn affords thousands of evaluations. **Bytes bind.**
+
+## Scope correction (2026-08-19)
+
+This repo briefly drifted into optimising *hand-written* search bots and climbing the
+ladder with them. That is not the experiment. Scripted bots exist here to calibrate and
+to be beaten offline; **the ladder belongs to the net.** The cost of the drift is
+recorded honestly under H4/H6/H7 below, because CodinGame leagues never demote and the
+scripted climbs are unrecoverable.
 
 ## Registered hypotheses (written 2026-08-19, before any result below existed)
 
@@ -94,7 +99,40 @@ README before results; ≥ 5–10 seeds with IQM and bootstrap CIs wherever vari
 ties reported as ties; honest nulls welcome; selfchecks via independently-coded second
 implementations.
 
+### H8 — the net (registered 2026-08-19, before the first real training run)
+
+This is the hypothesis the whole series exists for. Everything above is instrumentation.
+
+Setup: 324→128→128→81 Q-network, self-play with a league of past selves, replay buffer +
+target net + 3-step returns and no double-Q (the standing recipe from series 1/2,
+re-verified in-domain per house rule). Trained on one laptop GPU (RTX 4050, 6 GB).
+
+**Registered predictions:**
+
+1. **Beats every scripted baseline offline**, both seats, in this repo's verified
+   engine: ≥ 90% vs `random`, ≥ 75% vs `greedy`, and **> 50% vs the `ab` alpha-beta**
+   that reached global rank 1,804. The third is the load-bearing one — `ab` is the bar,
+   and it is a real bar, since a 62.5%-stronger tuned version of it still only reached
+   the top of Silver.
+2. **Fits the budget with the quantisation loss measured, not assumed**: int8 + base85
+   under 100,000 bytes, and the int8 net loses **< 3%** win rate against the fp32 net
+   it was quantised from. (Series 1/2 never measured this; "it fits after quantisation"
+   is not the same claim as "it is as strong after quantisation".)
+3. **The emitted C++ is bit-exact with torch** on fuzzed inputs — same argmax on
+   ≥ 99.9% of random legal positions. A packer that silently changes the policy would
+   invalidate every ladder result downstream.
+4. **Ladder: the net beats global rank 1,804** — i.e. it is worth more than the scripted
+   alpha-beta that produced the account's current standing. **Registered risk, stated
+   plainly: I do not predict Legend.** A 68k-weight MLP with no search, against a field
+   whose top is MCTS+NN, may well stall in Gold. If it does, that is the result and it
+   gets reported as the result.
+
+**Registered null that would matter:** if the int8 net cannot beat `ab` offline, then
+the honest headline of this series is "a hand-written alpha-beta beat our net inside the
+same 100KB", and that is what will be written.
+
 ## Results
+
 
 *(fills in below this line only after the hypotheses above were committed.
 Chronology is the whole point.)*
