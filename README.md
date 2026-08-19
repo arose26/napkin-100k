@@ -107,3 +107,42 @@ level 2 — 25,000 games, **1,472,677 plies, 0 divergences**;
 level 1 — 2,000 games, 15,269 plies, 0 divergences.
 Repro: `python3 napkin_referee.py fuzz --other blind_engine.py --level 2 --games 25000 --seed 12`
 (and `--level 1 --games 2000 --seed 11`).
+
+**H3 — sandbox measurements: (a) FALSIFIED, (b) and (c) confirmed (2026-08-19).**
+Measured by submitting the probe bot (`napkin_referee.py probe`) to the real arena as
+Napkin100k, then reading its stderr out of a live replay.
+
+- **(a) FALSIFIED — the 100k cap counts UTF-8 BYTES, not UTF-16 code units.** We
+  predicted the community claim would hold. It does not. Discriminating experiment, run
+  against the venue's own compiler endpoint:
+
+  | source | UTF-8 bytes | UTF-16 units | codepoints | verdict |
+  |---|---|---|---|---|
+  | 60,000 × U+0100 padding | 125,824 | 65,824 | 65,824 | **REJECTED** |
+  | 60,000 × U+1F600 padding | 245,824 | 125,824 | 65,824 | **REJECTED** |
+  | ASCII padding | 100,000 | 100,000 | 100,000 | ACCEPTED |
+  | ASCII padding | 100,001 | 100,001 | 100,001 | **REJECTED** |
+  | U+0100 padding | 99,998 | 52,911 | 52,911 | ACCEPTED |
+
+  Rejection message: `Submitted code is too big. Max chars is 100000`. The first row is
+  decisive: only 65,824 UTF-16 units, still rejected. The last row rules out the reverse
+  error (a 52,911-unit source is fine at 99,998 bytes). **The budget is exactly 100,000
+  UTF-8 bytes, inclusive.** Consequence for the series: the "UTF-16 stretch" that would
+  have re-admitted a ~112KB 5-seed ensemble is dead; the conservative base85-in-ASCII
+  plan (~85–95KB of weights after the harness) is the only plan, and
+  ensemble→distillation (napkin-shrink) is now forced rather than optional.
+- **(b) CONFIRMED** — `avx2=1` in the sandbox (`avx512f=0`). Runtime-guarded AVX2 code
+  compiles and executes.
+- **(c) CONFIRMED** — int8 18k-param MLP (series-2 deployed shape) at **7.478 µs/eval**
+  measured in-sandbox, against a predicted < 20 µs. That is ~13,000 evals inside a
+  100 ms turn. Bytes bind; time does not. (Same binary locally: 4.8 µs — the sandbox is
+  ~1.6× slower, worth remembering when budgeting search.) The `#pragma GCC optimize`
+  line is load-bearing: CG compiles at `-O0` by default.
+
+Side result worth keeping: the sandbox's arithmetic checksum matched the local run
+bit-for-bit (`checksum=-1900643909`), so local timing/accuracy work transfers.
+
+**Wood league: CLEARED (2026-08-19).** The probe bot went **34–0** in its placement
+battles, took rank 1 of its Wood division, and promoted to **Bronze**, where the real
+Ultimate rules begin. Bronze placement was still settling at the time of writing — the
+standing there is recorded below once stable, not before.

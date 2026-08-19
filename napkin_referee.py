@@ -412,11 +412,14 @@ def cmd_cg(args):
     Trusts the referee's set for actual play."""
     eng = Engine(args.level)
     pol = POLICIES[args.policy](seed=args.seed, budget_ms=args.budget_ms)
+    my_index = None
     while True:
         try:
             opp_row, opp_col = map(int, input().split())
         except EOFError:
             return 0
+        if my_index is None:
+            my_index = 0 if opp_row == -1 else 1
         if opp_row != -1:
             try:
                 eng.play(opp_row, opp_col)
@@ -435,6 +438,11 @@ def cmd_cg(args):
         a = pol.act(eng)
         eng.play(*a)
         print(f"{a[0]} {a[1]}", flush=True)
+        if eng.game_over:
+            # replica's predicted outcome, compared against the referee's real
+            # scores by the Java-side fuzz harness (H1)
+            print(f"PREDICT me={my_index} scores={eng.scores[0]},{eng.scores[1]} "
+                  f"winner={eng.winner} plies={eng.moves}", file=sys.stderr, flush=True)
 
 
 def cmd_bench(args):
@@ -449,6 +457,176 @@ def cmd_bench(args):
             plies += 1
     dt = time.perf_counter() - t0
     print(f"{plies} plies in {dt:.2f}s = {plies/dt:,.0f} plies/s (random playouts)")
+
+
+# -- probe bot (emitted C++, submitted to the real CG sandbox) ------------------
+
+PROBE_CPP = r'''/* napkin-100k series probe bot (napkin-referee H3). Fully disclosed:
+ * this account (Napkin100k) runs open-science experiments - see the profile bio.
+ * This bot measures the CG sandbox (stderr lines prefixed PROBE) and plays a
+ * simple heuristic game. Emitted by napkin_referee.py (repo: napkin-referee). */
+#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <chrono>
+#include <vector>
+#include <algorithm>
+
+// ---- measurement: scalar int8 MLP, series-2 deployed shape 10-128-128-3 ----
+static int8_t W1[10*128], W2[128*128], W3[128*3];
+static void fill(int8_t* w, int n, uint32_t& s) {
+    for (int i = 0; i < n; i++) { s = s*1664525u + 1013904223u; w[i] = (int8_t)(s >> 24); }
+}
+static int32_t mlp_eval(const int8_t* x) {
+    int32_t h1[128], h2[128], out = 0;
+    for (int j = 0; j < 128; j++) {
+        int32_t a = 0;
+        for (int i = 0; i < 10; i++) a += (int32_t)x[i] * W1[i*128+j];
+        h1[j] = a > 0 ? a >> 4 : 0;
+    }
+    for (int j = 0; j < 128; j++) {
+        int32_t a = 0;
+        for (int i = 0; i < 128; i++) a += h1[i] * W2[i*128+j];
+        h2[j] = a > 0 ? a >> 8 : 0;
+    }
+    for (int j = 0; j < 3; j++) {
+        int32_t a = 0;
+        for (int i = 0; i < 128; i++) a += h2[i] * W3[i*3+j];
+        out += a;
+    }
+    return out;
+}
+
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+static int32_t avx2_touch() {
+    // trivial AVX2 use; only called after a runtime cpu check
+    volatile int32_t v = 0;
+    for (int i = 0; i < 32; i++) v += W2[i];
+    return v;
+}
+#endif
+
+static void run_probe() {
+    bool avx2 = __builtin_cpu_supports("avx2");
+    bool avx512 = __builtin_cpu_supports("avx512f");
+    uint32_t s = 42;
+    fill(W1, 10*128, s); fill(W2, 128*128, s); fill(W3, 128*3, s);
+    int8_t x[10];
+    for (int i = 0; i < 10; i++) x[i] = (int8_t)(i * 7 + 1);
+    volatile int32_t sink = 0;
+    // warmup
+    for (int k = 0; k < 100; k++) { x[0] = (int8_t)k; sink += mlp_eval(x); }
+    auto t0 = std::chrono::steady_clock::now();
+    const int N = 10000;
+    for (int k = 0; k < N; k++) { x[0] = (int8_t)k; x[1] = (int8_t)(k>>8); sink += mlp_eval(x); }
+    auto t1 = std::chrono::steady_clock::now();
+    double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    int32_t touch = avx2 ? avx2_touch() : -1;
+    fprintf(stderr, "PROBE avx2=%d avx512f=%d mlp18k_per_eval_us=%.3f checksum=%d touch=%d\n",
+            (int)avx2, (int)avx512, us / N, (int)sink, (int)touch);
+}
+
+// ---- play: from the referee-provided valid list + tracked 9x9 grid ----------
+static int grid[9][9]; // 0 empty, 1 me, 2 opp
+
+static bool wins3(int b[3][3], int who, int r, int c) {
+    b[r][c] = who;
+    bool w = false;
+    for (int i = 0; i < 3 && !w; i++) {
+        if (b[i][0] == who && b[i][1] == who && b[i][2] == who) w = true;
+        if (b[0][i] == who && b[1][i] == who && b[2][i] == who) w = true;
+    }
+    if (b[0][0] == who && b[1][1] == who && b[2][2] == who) w = true;
+    if (b[2][0] == who && b[1][1] == who && b[0][2] == who) w = true;
+    b[r][c] = 0;
+    return w;
+}
+
+// full negamax for the plain 3x3 Wood game: perfect play, instant
+static int nega3(int b[3][3], int who, int* br, int* bc) {
+    int best = -2, r0 = -1, c0 = -1;
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {
+        if (b[r][c]) continue;
+        int v;
+        if (wins3(b, who, r, c)) v = 1;
+        else {
+            b[r][c] = who;
+            int orr, occ;
+            v = -nega3(b, 3 - who, &orr, &occ);
+            b[r][c] = 0;
+        }
+        if (v > best) { best = v; r0 = r; c0 = c; }
+        if (best == 1) break;
+    }
+    if (br) { *br = r0; *bc = c0; }
+    return r0 < 0 ? 0 : best;
+}
+
+int main() {
+    bool first = true;
+    bool level1 = true; // falsified the moment any coordinate exceeds 2
+    while (1) {
+        int orow, ocol;
+        if (scanf("%d%d", &orow, &ocol) != 2) return 0;
+        if (orow >= 0) grid[orow][ocol] = 2;
+        if (orow > 2 || ocol > 2) level1 = false;
+        int n; scanf("%d", &n);
+        if (n > 9) level1 = false;
+        std::vector<std::pair<int,int>> va(n);
+        for (int i = 0; i < n; i++) {
+            scanf("%d%d", &va[i].first, &va[i].second);
+            if (va[i].first > 2 || va[i].second > 2) level1 = false;
+        }
+        if (first) { run_probe(); first = false; }
+        int mr = va[0].first, mc = va[0].second;
+        if (level1) {
+            // plain 3x3 (or the indistinguishable board-0 opening of level 2):
+            // perfect negamax move - valid under both interpretations
+            int b[3][3];
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) b[r][c] = grid[r][c];
+            nega3(b, 1, &mr, &mc);
+            // guard: only trust it if the referee lists it as valid
+            bool ok = false;
+            for (auto& a : va) if (a.first == mr && a.second == mc) ok = true;
+            if (!ok) { mr = va[0].first; mc = va[0].second; }
+        } else {
+            // level 2 heuristic: win the small board > block their win > center > corner
+            int bestv = -1;
+            for (auto& a : va) {
+                int r = a.first, c = a.second, br = r / 3 * 3, bc = c / 3 * 3;
+                int b[3][3];
+                for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
+                    b[i][j] = grid[br+i][bc+j];
+                int lr = r % 3, lc = c % 3, v = 0;
+                if (wins3(b, 1, lr, lc)) v = 1000;
+                else if (wins3(b, 2, lr, lc)) v = 900;
+                else if (lr == 1 && lc == 1) v = 5;
+                else if (lr != 1 && lc != 1) v = 3;
+                if (v > bestv) { bestv = v; mr = r; mc = c; }
+            }
+        }
+        grid[mr][mc] = 1;
+        printf("%d %d\n", mr, mc);
+        fflush(stdout);
+    }
+}
+'''
+
+
+def cmd_probe(args):
+    src = PROBE_CPP
+    if args.utf16_blob:
+        # H3a discriminator: pad with U+0100 chars so UTF-8 bytes > 100KB while
+        # UTF-16 code units stay < 100k. Accepted <=> the cap counts UTF-16 units.
+        n = 60000
+        src += "/* UTF-16 counting probe: " + "Ā" * n + " */\n"
+    sys.stdout.write(src)
+    units = len(src.encode("utf-16-le")) // 2
+    print(f"probe source: {len(src.encode('utf-8'))} UTF-8 bytes, "
+          f"{units} UTF-16 units", file=sys.stderr)
+    return 0
 
 
 # -- selfcheck -----------------------------------------------------------------
@@ -545,7 +723,11 @@ def main():
     c.add_argument("--level", type=int, required=True, choices=(1, 2))
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--budget-ms", type=int, default=90)
+    p = sub.add_parser("probe")
+    p.add_argument("--utf16-blob", action="store_true")
     args = ap.parse_args()
+    if args.cmd == "probe":
+        sys.exit(cmd_probe(args))
     if args.cmd == "selfcheck":
         sys.exit(cmd_selfcheck(args))
     if args.cmd == "bench":
