@@ -285,6 +285,26 @@ for handing the opponent a free choice of board).
    into Legend — that is a genuine problem for the series premise and will be reported
    as one, not buried.**
 
+### H7 — MCTS, the algorithm this game actually rewards (registered 2026-08-19,
+### before implementing)
+
+Early H6 head-to-head numbers came in around 63%, under the 70% I registered — deeper
+search with a hand-tuned linear eval bought less than expected. That is itself the
+finding: **UTTT punishes evaluation-driven search.** The position is too tactical for a
+linear eval, which is exactly why the known-strong bots on this ladder are MCTS, not
+alpha-beta.
+
+`emit-cpp --version mcts` implements UCT with random playouts on the same bitboard,
+a preallocated node pool, and a light playout policy (take an immediate small-board win
+when one exists).
+
+**Registered predictions:**
+1. MCTS beats the tuned alpha-beta at ≥ 70% over ≥ 40 games, both sides.
+2. It reaches **Gold** comfortably.
+3. It still does **NOT** reach Legend (top 419). Same premise check as H6: if a
+   few-hundred-line scripted MCTS walks into Legend, the series' "you need a trained
+   net" framing is weaker than advertised, and that gets reported, not buried.
+
 **H5 result (2026-08-19):** submitted; in the CG sandbox it reaches **depth 7 / 456,704
 nodes** on the opening turn and 5 ply mid-game with no timeouts (the sandbox is ~1.6×
 slower than this laptop, consistent with the H3c measurement). It went straight to
