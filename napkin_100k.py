@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""napkin-referee — repo 1 of the napkin-100k series.
+"""napkin-100k — a self-play net that fits in a 100,000-byte source file.
 
-Exact offline replica of CodinGame's Ultimate Tic-Tac-Toe referee
-(github.com/CodinGame/game-ultimate-tictactoe, read 2026-08-19), plus the
-state/action encoders, scripted baselines, parity fuzz harnesses, and the CG
-stdin/stdout protocol adapter. See README.md for the registered hypotheses.
+One file, four jobs: an exact offline replica of CodinGame's Ultimate
+Tic-Tac-Toe referee (verified bit-level against the venue's own Java engine),
+a self-play Q-network trained in it, scripted opponents to measure that net
+against, and a packer that emits the trained net as a single self-contained
+C++ source. See README.md for the registered hypotheses.
 
 Semantics replicated from the Java source (not folklore):
 - level 1 (Wood): a single 3x3 board; win -> mover's score 10, full board -> 0-0 draw.
@@ -18,13 +19,19 @@ Semantics replicated from the Java source (not folklore):
   identity is the set. Parity is therefore checked on SETS.
 
 Usage:
-  napkin_referee.py selfcheck
+  napkin_100k.py selfcheck
   napkin_referee.py fuzz --other PATH [--games N] [--seed S] [--level {1,2}]
   napkin_referee.py match --a POLICY --b POLICY [--games N] [--seed S] [--level {1,2}]
   napkin_referee.py cg --policy POLICY --level {1,2} [--seed S] [--budget-ms MS]
   napkin_referee.py bench
 
-Policies: random | greedy | ab (time-budgeted iterative-deepening alpha-beta).
+Opponents (offline measurement only): random | greedy | ab (time-budgeted
+iterative-deepening alpha-beta).
+
+  napkin_100k.py train  --iters N            self-play training
+  napkin_100k.py pack   --net PT --out CPP   checkpoint -> single C++ source
+  napkin_100k.py check-net                   emitted C++ vs torch, move for move
+  napkin_100k.py bench-net --vs ab           net vs an opponent, both seats
 """
 
 import argparse
@@ -177,7 +184,7 @@ class Engine:
         self._valid = None
 
 
-# -- encoders (consumed by napkin-selfplay / napkin-forge) --------------------
+# -- encoders ----------------------------------------------------------------
 
 def action_index(row: int, col: int) -> int:
     """(row, col) in the 9x9 grid -> flat action id 0..80. Level 1 uses 0..2 coords."""
@@ -208,7 +215,7 @@ def encode_planes(eng: Engine, perspective: int):
     return planes
 
 
-# -- scripted baselines --------------------------------------------------------
+# -- scripted opponents (offline measurement) --------------------------------------------------
 
 class RandomPolicy:
     name = "random"
@@ -459,445 +466,6 @@ def cmd_bench(args):
             plies += 1
     dt = time.perf_counter() - t0
     print(f"{plies} plies in {dt:.2f}s = {plies/dt:,.0f} plies/s (random playouts)")
-
-
-# -- probe bot (emitted C++, submitted to the real CG sandbox) ------------------
-
-PROBE_CPP = r'''/* napkin-100k series probe bot (napkin-referee H3). Fully disclosed:
- * this account (Napkin100k) runs open-science experiments - see the profile bio.
- * This bot measures the CG sandbox (stderr lines prefixed PROBE) and plays a
- * simple heuristic game. Emitted by napkin_referee.py (repo: napkin-referee). */
-#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
-#include <cstdio>
-#include <cstdint>
-#include <cstring>
-#include <chrono>
-#include <vector>
-#include <algorithm>
-
-// ---- measurement: scalar int8 MLP, series-2 deployed shape 10-128-128-3 ----
-static int8_t W1[10*128], W2[128*128], W3[128*3];
-static void fill(int8_t* w, int n, uint32_t& s) {
-    for (int i = 0; i < n; i++) { s = s*1664525u + 1013904223u; w[i] = (int8_t)(s >> 24); }
-}
-static int32_t mlp_eval(const int8_t* x) {
-    int32_t h1[128], h2[128], out = 0;
-    for (int j = 0; j < 128; j++) {
-        int32_t a = 0;
-        for (int i = 0; i < 10; i++) a += (int32_t)x[i] * W1[i*128+j];
-        h1[j] = a > 0 ? a >> 4 : 0;
-    }
-    for (int j = 0; j < 128; j++) {
-        int32_t a = 0;
-        for (int i = 0; i < 128; i++) a += h1[i] * W2[i*128+j];
-        h2[j] = a > 0 ? a >> 8 : 0;
-    }
-    for (int j = 0; j < 3; j++) {
-        int32_t a = 0;
-        for (int i = 0; i < 128; i++) a += h2[i] * W3[i*3+j];
-        out += a;
-    }
-    return out;
-}
-
-#if defined(__GNUC__)
-__attribute__((target("avx2")))
-static int32_t avx2_touch() {
-    // trivial AVX2 use; only called after a runtime cpu check
-    volatile int32_t v = 0;
-    for (int i = 0; i < 32; i++) v += W2[i];
-    return v;
-}
-#endif
-
-static void run_probe() {
-    bool avx2 = __builtin_cpu_supports("avx2");
-    bool avx512 = __builtin_cpu_supports("avx512f");
-    uint32_t s = 42;
-    fill(W1, 10*128, s); fill(W2, 128*128, s); fill(W3, 128*3, s);
-    int8_t x[10];
-    for (int i = 0; i < 10; i++) x[i] = (int8_t)(i * 7 + 1);
-    volatile int32_t sink = 0;
-    // warmup
-    for (int k = 0; k < 100; k++) { x[0] = (int8_t)k; sink += mlp_eval(x); }
-    auto t0 = std::chrono::steady_clock::now();
-    const int N = 10000;
-    for (int k = 0; k < N; k++) { x[0] = (int8_t)k; x[1] = (int8_t)(k>>8); sink += mlp_eval(x); }
-    auto t1 = std::chrono::steady_clock::now();
-    double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-    int32_t touch = avx2 ? avx2_touch() : -1;
-    fprintf(stderr, "PROBE avx2=%d avx512f=%d mlp18k_per_eval_us=%.3f checksum=%d touch=%d\n",
-            (int)avx2, (int)avx512, us / N, (int)sink, (int)touch);
-}
-
-// ---- play: from the referee-provided valid list + tracked 9x9 grid ----------
-static int grid[9][9]; // 0 empty, 1 me, 2 opp
-
-static bool wins3(int b[3][3], int who, int r, int c) {
-    b[r][c] = who;
-    bool w = false;
-    for (int i = 0; i < 3 && !w; i++) {
-        if (b[i][0] == who && b[i][1] == who && b[i][2] == who) w = true;
-        if (b[0][i] == who && b[1][i] == who && b[2][i] == who) w = true;
-    }
-    if (b[0][0] == who && b[1][1] == who && b[2][2] == who) w = true;
-    if (b[2][0] == who && b[1][1] == who && b[0][2] == who) w = true;
-    b[r][c] = 0;
-    return w;
-}
-
-// full negamax for the plain 3x3 Wood game: perfect play, instant
-static int nega3(int b[3][3], int who, int* br, int* bc) {
-    int best = -2, r0 = -1, c0 = -1;
-    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {
-        if (b[r][c]) continue;
-        int v;
-        if (wins3(b, who, r, c)) v = 1;
-        else {
-            b[r][c] = who;
-            int orr, occ;
-            v = -nega3(b, 3 - who, &orr, &occ);
-            b[r][c] = 0;
-        }
-        if (v > best) { best = v; r0 = r; c0 = c; }
-        if (best == 1) break;
-    }
-    if (br) { *br = r0; *bc = c0; }
-    return r0 < 0 ? 0 : best;
-}
-
-int main() {
-    bool first = true;
-    bool level1 = true; // falsified the moment any coordinate exceeds 2
-    while (1) {
-        int orow, ocol;
-        if (scanf("%d%d", &orow, &ocol) != 2) return 0;
-        if (orow < -1 || orow > 8 || ocol < -1 || ocol > 8) return 1; // never trust stdin
-        if (orow >= 0 && ocol >= 0) grid[orow][ocol] = 2;
-        if (orow > 2 || ocol > 2) level1 = false;
-        int n; if (scanf("%d", &n) != 1 || n < 1 || n > 81) return 1;
-        if (n > 9) level1 = false;
-        std::vector<std::pair<int,int>> va(n);
-        for (int i = 0; i < n; i++) {
-            if (scanf("%d%d", &va[i].first, &va[i].second) != 2) return 1;
-            if (va[i].first < 0 || va[i].first > 8 || va[i].second < 0 || va[i].second > 8) return 1;
-            if (va[i].first > 2 || va[i].second > 2) level1 = false;
-        }
-        if (first) { run_probe(); first = false; }
-        int mr = va[0].first, mc = va[0].second;
-        if (level1) {
-            // plain 3x3 (or the indistinguishable board-0 opening of level 2):
-            // perfect negamax move - valid under both interpretations
-            int b[3][3];
-            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) b[r][c] = grid[r][c];
-            nega3(b, 1, &mr, &mc);
-            // guard: only trust it if the referee lists it as valid
-            bool ok = false;
-            for (auto& a : va) if (a.first == mr && a.second == mc) ok = true;
-            if (!ok) { mr = va[0].first; mc = va[0].second; }
-        } else {
-            // level 2 heuristic: win the small board > block their win > center > corner
-            int bestv = -1;
-            for (auto& a : va) {
-                int r = a.first, c = a.second, br = r / 3 * 3, bc = c / 3 * 3;
-                int b[3][3];
-                for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
-                    b[i][j] = grid[br+i][bc+j];
-                int lr = r % 3, lc = c % 3, v = 0;
-                if (wins3(b, 1, lr, lc)) v = 1000;
-                else if (wins3(b, 2, lr, lc)) v = 900;
-                else if (lr == 1 && lc == 1) v = 5;
-                else if (lr != 1 && lc != 1) v = 3;
-                if (v > bestv) { bestv = v; mr = r; mc = c; }
-            }
-        }
-        grid[mr][mc] = 1;
-        printf("%d %d\n", mr, mc);
-        fflush(stdout);
-    }
-}
-'''
-
-
-AB_CPP = r'''/* napkin-100k series: the `ab` baseline ported to C++ (napkin-referee).
- * Same search and same eval terms as the Python ABPolicy in napkin_referee.py -
- * the ONLY intended difference is nodes searched per turn. Disclosed bot, see
- * the Napkin100k profile and github.com/arose26/napkin-referee.
- * CG compiles at -O0 by default, hence the pragma. */
-#pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
-#include <cstdio>
-#include <cstdint>
-#include <cstring>
-#include <chrono>
-#include <algorithm>
-
-typedef uint16_t u16;
-static const u16 WIN[8] = {0700, 070, 07, 0444, 0222, 0111, 0421, 0124};
-static const u16 FULL = 0777;
-
-static inline bool wins(u16 m) {
-    for (int i = 0; i < 8; i++) if ((m & WIN[i]) == WIN[i]) return true;
-    return false;
-}
-// lines where `mine` has exactly 2 and `block` none  (same term as the Python eval)
-static inline int threats(u16 mine, u16 block) {
-    int n = 0;
-    for (int i = 0; i < 8; i++)
-        if (!(block & WIN[i]) && __builtin_popcount((unsigned)(mine & WIN[i])) == 2) n++;
-    return n;
-}
-
-struct Pos {
-    u16 b[2][9];   // per-player occupancy of each small board
-    u16 own[2];    // boards won, as a 9-bit mask
-    u16 drawn;     // boards full with no winner
-    int last;      // previous move cell 0..80, -1 if none
-    int side;      // player to move: 0 or 1
-    int cnt[2];    // small boards won (the referee's running score)
-};
-
-static inline bool decided(const Pos& p, int b) {
-    return ((p.own[0] | p.own[1] | p.drawn) >> b) & 1;
-}
-
-// writes legal cells (0..80) into out[], returns how many
-static int legal(const Pos& p, int* out) {
-    int n = 0;
-    int tb = p.last < 0 ? -1 : ((p.last / 9) % 3) * 3 + (p.last % 9) % 3;
-    if (tb >= 0 && !decided(p, tb)) {
-        u16 occ = p.b[0][tb] | p.b[1][tb];
-        int br = (tb / 3) * 3, bc = (tb % 3) * 3;
-        for (int i = 0; i < 9; i++)
-            if (!((occ >> i) & 1)) out[n++] = (br + i / 3) * 9 + bc + i % 3;
-        return n;
-    }
-    for (int b = 0; b < 9; b++) {
-        if (decided(p, b)) continue;
-        u16 occ = p.b[0][b] | p.b[1][b];
-        int br = (b / 3) * 3, bc = (b % 3) * 3;
-        for (int i = 0; i < 9; i++)
-            if (!((occ >> i) & 1)) out[n++] = (br + i / 3) * 9 + bc + i % 3;
-    }
-    return n;
-}
-
-// returns true if this move ended the game with `side` winning the master board
-static bool apply(Pos& p, int cell) {
-    int r = cell / 9, c = cell % 9;
-    int b = (r / 3) * 3 + c / 3, i = (r % 3) * 3 + (c % 3);
-    int s = p.side;
-    p.b[s][b] |= (u16)(1 << i);
-    bool masterWin = false;
-    if (wins(p.b[s][b])) {
-        p.own[s] |= (u16)(1 << b);
-        p.cnt[s]++;
-        if (wins(p.own[s])) masterWin = true;
-    } else if ((p.b[0][b] | p.b[1][b]) == FULL) {
-        p.drawn |= (u16)(1 << b);
-    }
-    p.last = cell;
-    p.side = 1 - s;
-    return masterWin;
-}
-
-static int evaluate(const Pos& p, int me) {
-    int opp = 1 - me;
-    int v = 100 * (p.cnt[me] - p.cnt[opp]);
-    v += 10 * (threats(p.own[me], (u16)(p.own[opp] | p.drawn))
-             - threats(p.own[opp], (u16)(p.own[me] | p.drawn)));
-    for (int b = 0; b < 9; b++)
-        if (!decided(p, b))
-            v += threats(p.b[me][b], p.b[opp][b]) - threats(p.b[opp][b], p.b[me][b]);
-    return v;
-}
-
-static std::chrono::steady_clock::time_point deadline;
-static bool timeUp = false;
-static long nodes = 0;
-static inline bool outOfTime() {
-    if ((++nodes & 1023) == 0 && std::chrono::steady_clock::now() > deadline) timeUp = true;
-    return timeUp;
-}
-
-static const int WIN_SCORE = 30000;
-
-static int search(Pos& p, int depth, int alpha, int beta, int me, bool ended, int winner) {
-    if (ended) return winner == me ? WIN_SCORE - (64 - depth) : -(WIN_SCORE - (64 - depth));
-    int mv[81];
-    int n = legal(p, mv);
-    if (n == 0) {  // no moves: most small boards won decides it
-        int d = p.cnt[me] - p.cnt[1 - me];
-        return d > 0 ? WIN_SCORE - 100 : d < 0 ? -(WIN_SCORE - 100) : 0;
-    }
-    if (depth == 0) return evaluate(p, me);
-    if (outOfTime()) return evaluate(p, me);
-    bool maxing = (p.side == me);
-    int best = maxing ? -WIN_SCORE * 2 : WIN_SCORE * 2;
-    for (int k = 0; k < n; k++) {
-        Pos q = p;
-        bool w = apply(q, mv[k]);
-        int v = search(q, depth - 1, alpha, beta, me, w, w ? p.side : -1);
-        if (maxing) { if (v > best) best = v; if (best > alpha) alpha = best; }
-        else        { if (v < best) best = v; if (best < beta)  beta  = best; }
-        if (beta <= alpha) break;
-        if (timeUp) break;
-    }
-    return best;
-}
-
-int main() {
-    Pos p;
-    memset(&p, 0, sizeof(p));
-    p.last = -1; p.side = 0;
-    bool first = true;
-    while (true) {
-        int orow, ocol;
-        if (scanf("%d%d", &orow, &ocol) != 2) return 0;
-        if (orow < -1 || orow > 8 || ocol < -1 || ocol > 8) return 1;
-        if (orow >= 0 && ocol >= 0) apply(p, orow * 9 + ocol);
-        int n;
-        if (scanf("%d", &n) != 1 || n < 1 || n > 81) return 1;
-        int refmv[81];
-        for (int i = 0; i < n; i++) {
-            int r, c;
-            if (scanf("%d%d", &r, &c) != 2) return 1;
-            if (r < 0 || r > 8 || c < 0 || c > 8) return 1;
-            refmv[i] = r * 9 + c;
-        }
-        // budget: 100ms per turn, 1000ms on the first - stay well inside both
-        int budget = first ? 900 : 88;
-        first = false;
-        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
-        timeUp = false; nodes = 0;
-        int me = p.side;
-        int best = refmv[0], depthReached = 0;
-        for (int depth = 1; depth <= 81 && !timeUp; depth++) {
-            int localBest = -WIN_SCORE * 2, localMove = refmv[0];
-            for (int k = 0; k < n; k++) {
-                Pos q = p;
-                bool w = apply(q, refmv[k]);
-                int v = search(q, depth - 1, -WIN_SCORE * 2, WIN_SCORE * 2, me, w, w ? me : -1);
-                if (timeUp) break;
-                if (v > localBest) { localBest = v; localMove = refmv[k]; }
-            }
-            if (!timeUp) { best = localMove; depthReached = depth; }
-            if (localBest >= WIN_SCORE - 200) break;   // forced win found
-        }
-        fprintf(stderr, "depth=%d nodes=%ld\n", depthReached, nodes);
-        apply(p, best);
-        printf("%d %d\n", best / 9, best % 9);
-        fflush(stdout);
-    }
-}
-'''
-
-
-
-
-def cmd_check_cpp(args):
-    """Compile an emitted C++ bot and drive it through the CG protocol using THIS
-    file's verified engine as the referee. Asserts, every turn:
-      1. the move it returns is legal;
-      2. if a move exists that wins the master board outright, it plays one.
-    (2) is the sharp one: a sign error in a negamax mate score shows up here as a
-    bot that walks past forced wins, which strength testing alone can hide."""
-    import shutil
-    import subprocess
-    import tempfile
-    import os
-
-    src = AB_CPP
-    tmp = tempfile.mkdtemp()
-    cpp, exe = os.path.join(tmp, "b.cpp"), os.path.join(tmp, "b")
-    with open(cpp, "w") as f:
-        f.write(src)
-    subprocess.run(["g++", "-O2", "-o", exe, cpp], check=True)
-
-    rng = random.Random(args.seed)
-    wins_taken = wins_offered = 0
-    for game in range(args.games):
-        bot_idx = game % 2
-        eng = Engine(2)
-        proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        try:
-            while not eng.game_over:
-                if eng.current_player != bot_idx:
-                    eng.play(*rng.choice(sorted(eng.valid_actions())))
-                    continue
-                va = sorted(eng.valid_actions())
-                # which legal moves win the whole game right now?
-                st = eng.get_state()
-                winning = []
-                for a in va:
-                    eng.play(*a)
-                    if eng.game_over and eng.winner == bot_idx:
-                        winning.append(a)
-                    eng.set_state(st)
-                last = eng.last if eng.last is not None else (-1, -1)
-                proc.stdin.write(f"{last[0]} {last[1]}\n{len(va)}\n")
-                for a in va:
-                    proc.stdin.write(f"{a[0]} {a[1]}\n")
-                proc.stdin.flush()
-                line = proc.stdout.readline()
-                if not line:
-                    raise AssertionError("bot died mid-game")
-                mv = tuple(int(x) for x in line.split())
-                assert mv in eng.valid_actions(), f"ILLEGAL move {mv}, legal={va}"
-                if winning:
-                    wins_offered += 1
-                    assert mv in winning, (
-                        f"bot declined a forced win: played {mv}, wins were {winning}")
-                    wins_taken += 1
-                eng.play(*mv)
-        finally:
-            proc.kill()
-            proc.wait()
-    shutil.rmtree(tmp, ignore_errors=True)
-    print(f"check-cpp OK: {args.games} games, all moves legal, "
-          f"{wins_taken}/{wins_offered} forced wins taken")
-    return 0
-
-
-def cmd_emit_cpp(args):
-    src = AB_CPP
-    sys.stdout.write(src)
-    print(f"emitted ab-cpp: {len(src.encode('utf-8'))} UTF-8 bytes (cap 100000)",
-          file=sys.stderr)
-    return 0
-
-
-def cmd_emit(args):
-    """Print a standalone CodinGame Python bot: this file plus a bootstrap that
-    runs the chosen policy over the CG protocol. (A file that writes a file.)"""
-    with open(__file__, encoding="utf-8") as f:
-        src = f.read()
-    src = src.replace('if __name__ == "__main__":\n    main()\n', "")
-    src += (
-        "\n# ---- CodinGame entry point (emitted by `napkin_referee.py emit`) ----\n"
-        "# Disclosed bot for the napkin-100k series (github.com/arose26).\n"
-        "import argparse as _ap\n"
-        f"cmd_cg(_ap.Namespace(policy={args.policy!r}, level={args.level}, "
-        f"seed={args.seed}, budget_ms={args.budget_ms}))\n"
-    )
-    sys.stdout.write(src)
-    print(f"emitted {args.policy}: {len(src.encode('utf-8'))} UTF-8 bytes "
-          f"(cap 100000)", file=sys.stderr)
-    return 0
-
-
-def cmd_probe(args):
-    src = PROBE_CPP
-    if args.utf16_blob:
-        # H3a discriminator: pad with U+0100 chars so UTF-8 bytes > 100KB while
-        # UTF-16 code units stay < 100k. Accepted <=> the cap counts UTF-16 units.
-        n = 60000
-        src += "/* UTF-16 counting probe: " + "Ā" * n + " */\n"
-    sys.stdout.write(src)
-    units = len(src.encode("utf-16-le")) // 2
-    print(f"probe source: {len(src.encode('utf-8'))} UTF-8 bytes, "
-          f"{units} UTF-16 units", file=sys.stderr)
-    return 0
 
 
 # == the net ===================================================================
@@ -1607,24 +1175,6 @@ def cmd_selfcheck(args):
     assert sum(pl[162:243]) == 8  # 8 legal replies in the center board
     assert action_index(*index_action(80)) == 80
 
-    # Probe emitter: the two things that silently break it are a missing
-    # optimize pragma (CG compiles -O0) and miscounted source size.
-    assert '#pragma GCC optimize' in PROBE_CPP
-    assert len(PROBE_CPP.encode("utf-8")) < 100000  # the venue's real cap (measured)
-
-    # Emitted bots must be standalone: no argparse main left to swallow argv, a
-    # bootstrap call present, and still under the byte cap.
-    import io
-    from contextlib import redirect_stdout, redirect_stderr
-    buf = io.StringIO()
-    with redirect_stdout(buf), redirect_stderr(io.StringIO()):
-        cmd_emit(argparse.Namespace(policy="greedy", level=2, seed=0, budget_ms=85))
-    bot = buf.getvalue()
-    assert 'if __name__ == "__main__":\n    main()' not in bot
-    assert "cmd_cg(_ap.Namespace(policy='greedy'" in bot
-    assert len(bot.encode("utf-8")) < 100000
-    compile(bot, "emitted_bot", "exec")  # must at least parse
-
     # Transition builder: the RL bug that hides best. Play one fixed game and
     # assert the shape of what training will consume.
     class _FixedNet:
@@ -1681,8 +1231,6 @@ def main():
     c.add_argument("--level", type=int, required=True, choices=(1, 2))
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--budget-ms", type=int, default=90)
-    p = sub.add_parser("probe")
-    p.add_argument("--utf16-blob", action="store_true")
     bn = sub.add_parser("bench-net")
     bn.add_argument("--net", default="out/net.pt")
     bn.add_argument("--cpp", default=None)
@@ -1719,28 +1267,13 @@ def main():
     tr.add_argument("--device", default="auto")
     tr.add_argument("--seed", type=int, default=0)
     tr.add_argument("--out", default="out/net.pt")
-    cc = sub.add_parser("check-cpp")
-    cc.add_argument("--games", type=int, default=4)
-    cc.add_argument("--seed", type=int, default=3)
-    ec = sub.add_parser("emit-cpp")
-    e = sub.add_parser("emit")
-    e.add_argument("--policy", required=True, choices=POLICIES)
-    e.add_argument("--level", type=int, default=2, choices=(1, 2))
-    e.add_argument("--seed", type=int, default=0)
-    e.add_argument("--budget-ms", type=int, default=85)
     s = sub.add_parser("snapshot")
     s.add_argument("--arena", default="tic-tac-toe")
     s.add_argument("--pseudo", default="Napkin100k")
     s.add_argument("--out", default="out/ladder_snapshots.jsonl")
     args = ap.parse_args()
-    if args.cmd == "probe":
-        sys.exit(cmd_probe(args))
     if args.cmd == "snapshot":
         sys.exit(cmd_snapshot(args))
-    if args.cmd == "emit":
-        sys.exit(cmd_emit(args))
-    if args.cmd == "emit-cpp":
-        sys.exit(cmd_emit_cpp(args))
     if args.cmd == "bench-net":
         sys.exit(cmd_bench_net(args))
     if args.cmd == "check-net":
@@ -1749,8 +1282,6 @@ def main():
         sys.exit(cmd_pack(args))
     if args.cmd == "train":
         sys.exit(cmd_train(args))
-    if args.cmd == "check-cpp":
-        sys.exit(cmd_check_cpp(args))
     if args.cmd == "selfcheck":
         sys.exit(cmd_selfcheck(args))
     if args.cmd == "bench":

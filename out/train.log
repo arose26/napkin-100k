@@ -1,2 +1,3 @@
 iter 20/500 eps 0.84 buf 297895 loss 0.0079 vs-random 0.667 vs-greedy 0.122 (49s)
 iter 40/500 eps 0.78 buf 400000 loss 0.0086 vs-random 0.705 vs-greedy 0.195 (143s)
+iter 60/500 eps 0.72 buf 400000 loss 0.0076 vs-random 0.545 vs-greedy 0.163 (218s)

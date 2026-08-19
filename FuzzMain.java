@@ -1,7 +1,7 @@
 /* H1 venue-parity fuzz driver (verification artifact, not the deliverable).
  *
  * Runs the OFFICIAL CodinGame UTTT referee (github.com/CodinGame/game-ultimate-tictactoe,
- * built locally with its own SDK) headlessly, with napkin_referee.py's CG protocol
+ * built locally with its own SDK) headlessly, with napkin_100k.py's CG protocol
  * adapter playing BOTH seats on a random policy. The adapter recomputes the valid-action
  * set every turn and prints PARITY MISMATCH to stderr on any divergence from what the
  * referee sent; when its own move ends the game it prints its predicted final scores
@@ -25,8 +25,8 @@ public class FuzzMain {
         int games = Integer.parseInt(args[0]);
         int level = Integer.parseInt(args[1]);
         long seed0 = Long.parseLong(args[2]);
-        String py = System.getenv().getOrDefault("NAPKIN_REFEREE_PY",
-                System.getProperty("user.dir") + "/napkin_referee.py");
+        String py = System.getenv().getOrDefault("NAPKIN_100K_PY",
+                System.getProperty("user.dir") + "/napkin_100k.py");
         // optional custom agent commands (args 3/4); "SEED" is replaced per game
         String agent0 = args.length > 3 ? args[3]
                 : "python3 " + py + " cg --policy random --level " + level + " --seed SEED0";
