@@ -1036,6 +1036,46 @@ def improved_policy(t, net, tau=1.0):
     return q, pi, legal
 
 
+def _sym_perms(device):
+    """The 8 dihedral symmetries of Ultimate Tic-Tac-Toe as cell permutations.
+
+    A symmetry must act on the master board AND identically on every small
+    board, or the "your move picks my board" rule breaks. Applying transform g
+    to (board_row, board_col) and to (inner_row, inner_col) together is exactly
+    such a symmetry, so a position and its image are the same game -- which
+    makes this free training data: 8x the samples for no extra self-play.
+    """
+    import torch
+
+    def t(g, r, c):
+        if g & 4:
+            r, c = c, r          # transpose
+        for _ in range(g & 3):
+            r, c = c, 2 - r      # rotate
+        return r, c
+
+    perms = []
+    for g in range(8):
+        p = [0] * 81
+        for cell in range(81):
+            R, C = cell // 9, cell % 9
+            br, bc, ir, ic = R // 3, C // 3, R % 3, C % 3
+            nbr, nbc = t(g, br, bc)
+            nir, nic = t(g, ir, ic)
+            p[cell] = (nbr * 3 + nir) * 9 + (nbc * 3 + nic)
+        perms.append(p)
+    return torch.tensor(perms, dtype=torch.long, device=device)
+
+
+def augment(x, pi, perm):
+    """Apply one symmetry to features [N,324] (4 planes of 81) and policy [N,81].
+    The owned-difference plane is constant within a small board, so permuting
+    cells transforms it correctly too."""
+    n = x.shape[0]
+    xp = x.view(n, 4, 81)[:, :, perm].reshape(n, 324)
+    return xp, pi[:, perm]
+
+
 def cmd_train_gpu(args):
     """Self-play on GPU with one-ply-improved policy targets (H6).
 
@@ -1074,15 +1114,23 @@ def cmd_train_gpu(args):
     t0 = time.time()
     games_done = 0
     ar = torch.arange(B, device=device)
+    perms = _sym_perms(device)
 
     for it in range(1, args.iters + 1):
         for _ in range(args.steps_per_iter):
             x = t.encode()
             _, pi, legal = improved_policy(t, net, tau=args.tau)
+            # Exploration belongs in the opening. Sampling every ply (plus a
+            # uniform mix) makes outcomes nearly unpredictable, and then the
+            # value head is being asked to regress noise -- which is exactly
+            # what a value loss stuck near 0.88 looks like.
             u = legal.float()
             u = u / u.sum(dim=1, keepdim=True).clamp_min(1e-9)
             act_p = (1 - args.eps) * pi + args.eps * u
-            mv = torch.multinomial(act_p.clamp_min(1e-12), 1).squeeze(1)
+            mv_s = torch.multinomial(act_p.clamp_min(1e-12), 1).squeeze(1)
+            mv_g = pi.argmax(dim=1)
+            opening = plies < args.opening_plies
+            mv = torch.where(opening, mv_s, mv_g)
 
             live = ~t.done
             slot = plies.clamp(max=MAXP - 1)
@@ -1121,10 +1169,14 @@ def cmd_train_gpu(args):
             continue
         for _ in range(args.updates_per_iter):
             idx = torch.randint(0, filled, (args.batch,), device=device)
-            logits, v = net(bf_x[idx])
-            loss_p = -(bf_p[idx] * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+            xb, pb = bf_x[idx], bf_p[idx]
+            if args.augment:
+                g = int(torch.randint(0, 8, (1,)).item())
+                xb, pb = augment(xb, pb, perms[g])
+            logits, v = net(xb)
+            loss_p = -(pb * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
             loss_v = F.mse_loss(v, bf_z[idx])
-            loss = loss_p + loss_v
+            loss = loss_p + args.value_weight * loss_v
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             opt.step()
@@ -2495,6 +2547,27 @@ def cmd_selfcheck(args):
         "non-terminal transition is missing its next-state legal mask"
     assert all(len(t[0]) == N_IN for t in trs), "state width mismatch"
 
+    # Symmetry augmentation: replaying a game through a symmetry must produce
+    # exactly the permuted position. If it does not, augmentation is feeding the
+    # net mislabelled data -- silently, and forever.
+    _perms = _sym_perms("cpu")
+    for _g in range(8):
+        _p = _perms[_g].tolist()
+        assert sorted(_p) == list(range(81)), f"symmetry {_g} is not a bijection"
+        _rng = random.Random(100 + _g)
+        _a, _b = Engine(2), Engine(2)
+        for _ in range(14):
+            if _a.game_over or _b.game_over:
+                break
+            _mv = _rng.choice(sorted(_a.valid_actions()))
+            _a.play(*_mv)
+            _im = _p[action_index(*_mv)]
+            _b.play(*index_action(_im))
+        _la = {_p[action_index(*x)] for x in _a.valid_actions()}
+        _lb = {action_index(*x) for x in _b.valid_actions()}
+        assert _la == _lb, (f"symmetry {_g} does not preserve legal moves: "
+                            f"{sorted(_la ^ _lb)}")
+
     # GPU engine: a second implementation of the rules is only trustworthy if it
     # agrees with the verified one. Same discipline as blind_engine.py, but the
     # divergence here would be silent -- training data would just be wrong.
@@ -2603,7 +2676,10 @@ def main():
     tg.add_argument("--buffer", type=int, default=600000)
     tg.add_argument("--lr", type=float, default=1e-3)
     tg.add_argument("--tau", type=float, default=0.5)
-    tg.add_argument("--eps", type=float, default=0.15)
+    tg.add_argument("--eps", type=float, default=0.08)
+    tg.add_argument("--opening-plies", type=int, default=12)
+    tg.add_argument("--value-weight", type=float, default=1.0)
+    tg.add_argument("--augment", action="store_true", default=True)
     tg.add_argument("--eval-every", type=int, default=10)
     tg.add_argument("--eval-games", type=int, default=30)
     tg.add_argument("--device", default="auto")
