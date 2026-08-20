@@ -1114,13 +1114,17 @@ def improved_policy(t, net, tau=1.0):
 
 
 def _sym_perms(device):
-    """The 8 dihedral symmetries of Ultimate Tic-Tac-Toe as cell permutations.
+    """The 8 dihedral symmetries of Ultimate Tic-Tac-Toe.
 
     A symmetry must act on the master board AND identically on every small
     board, or the "your move picks my board" rule breaks. Applying transform g
     to (board_row, board_col) and to (inner_row, inner_col) together is exactly
     such a symmetry, so a position and its image are the same game -- which
     makes this free training data: 8x the samples for no extra self-play.
+
+    Returns (cell_perms [8,81], board_perms [8,9]): the feature vector needs
+    both, because its per-cell planes and its per-board features transform
+    differently.
     """
     import torch
 
@@ -1131,7 +1135,7 @@ def _sym_perms(device):
             r, c = c, 2 - r      # rotate
         return r, c
 
-    perms = []
+    perms, bperms = [], []
     for g in range(8):
         p = [0] * 81
         for cell in range(81):
@@ -1141,16 +1145,31 @@ def _sym_perms(device):
             nir, nic = t(g, ir, ic)
             p[cell] = (nbr * 3 + nir) * 9 + (nbc * 3 + nic)
         perms.append(p)
-    return torch.tensor(perms, dtype=torch.long, device=device)
+        bp = [0] * 9
+        for b in range(9):
+            nbr, nbc = t(g, b // 3, b % 3)
+            bp[b] = nbr * 3 + nbc
+        bperms.append(bp)
+    return (torch.tensor(perms, dtype=torch.long, device=device),
+            torch.tensor(bperms, dtype=torch.long, device=device))
 
 
-def augment(x, pi, perm):
-    """Apply one symmetry to features [N,324] (4 planes of 81) and policy [N,81].
-    The owned-difference plane is constant within a small board, so permuting
-    cells transforms it correctly too."""
+def augment(x, pi, perm, bperm):
+    """Apply one symmetry to features [N,N_IN] and policy [N,81].
+
+    The feature vector is NOT uniform, and treating it as one array is how a
+    symmetry silently corrupts training data: the first four planes are per-cell
+    and take the cell permutation, the next four blocks of nine are per-board
+    and take the BOARD permutation, and the trailing scalars (free-choice flag,
+    master threats, board difference) are symmetry-invariant.
+    """
+    import torch
     n = x.shape[0]
-    xp = x.view(n, 4, 81)[:, :, perm].reshape(n, 324)
-    return xp, pi[:, perm]
+    parts = [x[:, :324].view(n, 4, 81)[:, :, perm].reshape(n, 324)]
+    for off in (324, 333, 342, 351):
+        parts.append(x[:, off:off + 9][:, bperm])
+    parts.append(x[:, 360:])
+    return torch.cat(parts, dim=1), pi[:, perm]
 
 
 def cmd_train_gpu(args):
@@ -2722,7 +2741,7 @@ def cmd_selfcheck(args):
     # Symmetry augmentation: replaying a game through a symmetry must produce
     # exactly the permuted position. If it does not, augmentation is feeding the
     # net mislabelled data -- silently, and forever.
-    _perms = _sym_perms("cpu")
+    _perms, _bperms = _sym_perms("cpu")
     for _g in range(8):
         _p = _perms[_g].tolist()
         assert sorted(_p) == list(range(81)), f"symmetry {_g} is not a bijection"
@@ -2764,7 +2783,7 @@ def cmd_selfcheck(args):
         _pa = _t.zeros(1, N_ACT)
         for _act in _a.valid_actions():
             _pa[0, action_index(*_act)] = 1.0
-        _xg, _pg = augment(_xa, _pa, _perms[_g])
+        _xg, _pg = augment(_xa, _pa, _perms[_g], _bperms[_g])
         _xb = _t.tensor([encode_planes(_b, _b.current_player)], dtype=_t.float32)
         assert _t.equal(_xg, _xb), f"augment({_g}) features != replayed position"
         _legal_b = {action_index(*x) for x in _b.valid_actions()}
