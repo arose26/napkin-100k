@@ -1100,7 +1100,7 @@ class TensorUTTT:
         return c
 
 
-def improved_policy(t, net, tau=1.0):
+def improved_policy_1ply(t, net, tau=1.0):
     """One-ply policy improvement, entirely on GPU.
 
     For every game and EVERY one of the 81 moves at once: play it in a cloned
@@ -1135,6 +1135,111 @@ def improved_policy(t, net, tau=1.0):
     pi = pi * legal
     pi = pi / pi.sum(dim=1, keepdim=True).clamp_min(1e-9)
     return q, pi, legal
+
+
+
+def improved_policy(t, net, tau=1.0, depth=1, topk=8):
+    """Policy improvement. depth=1 is the original one-ply operator; depth=2 does a
+    two-ply lookahead restricted to the top-k moves.
+
+    WHY the restriction. In napkin-100k-connect4 the target was exact minimax over
+    all 100 action pairs, and it was worth 0.763 -> 0.675 of value loss. Here the
+    action space is 81, so all 6,561 pairs will not fit. But the measurement that
+    forced this says the one-ply target is the binding constraint, not temperature:
+
+        connect-4, 10 actions:  target entropy 1.9400 vs uniform 2.3026  -> 0.363 nats
+        UTTT,      81 actions:  target entropy 2.0646 vs uniform 2.1017  -> 0.037 nats
+
+    A one-ply target in UTTT carries a tenth of the information the connect-4 one
+    did -- filling one of 81 cells rarely changes the position's value, so the Q
+    values come out nearly flat and there is nothing for a temperature to sharpen.
+    That is why lowering tau transferred as +0.105 there and ~0.000 here.
+
+    So: rank the 81 moves by one-ply Q, keep the top k, and for each of those look at
+    the opponent's k best replies (ranked by the POLICY head, one extra forward pass)
+    and take the minimum. Moves outside the top k keep their one-ply Q -- they were
+    already judged worse, and the softmax will suppress them anyway.
+
+    Cost at k=8, batch B: B*81 + B*8 + B*64 evaluations against B*81 for one ply,
+    i.e. under 2x, versus 81x for full two-ply.
+
+    NOT exact minimax: the opponent's replies are chosen by the policy head, so the
+    operator is only as sharp as that head. It is strictly stronger than one ply,
+    which is the claim being tested -- see `target-entropy`.
+    """
+    import torch
+    q, pi, legal = improved_policy_1ply(t, net, tau=tau)
+    if depth <= 1:
+        return q, pi, legal
+
+    B, dev = t.B, t.device
+    k = min(topk, N_ACT)
+    sel = q.masked_fill(~legal, -1e9).topk(k, dim=1).indices          # [B,k]
+    me = t.side
+
+    kids = t.clone_repeat(k)
+    kids.step(sel.reshape(-1))                                        # [B*k]
+    me_k = me.repeat_interleave(k)
+    with torch.no_grad():
+        opp_logits, _ = net(kids.encode())
+    legal_b = kids.legal_mask()
+    # the opponent's k most plausible replies, by their own policy head
+    rep = opp_logits.masked_fill(~legal_b, -1e9).topk(k, dim=1).indices  # [B*k,k]
+
+    gk = kids.clone_repeat(k)
+    gk.step(rep.reshape(-1))                                          # [B*k*k]
+    with torch.no_grad():
+        _, vg = net(gk.encode())
+    me_g = me_k.repeat_interleave(k)
+    exact = torch.where(gk.winner == me_g, torch.ones_like(vg),
+                        torch.where(gk.winner < 0, torch.zeros_like(vg),
+                                    -torch.ones_like(vg)))
+    sign = torch.where(gk.side == me_g, torch.ones_like(vg), -torch.ones_like(vg))
+    my_val = torch.where(gk.done, exact, sign * vg).view(B * k, k)
+    # a reply slot is real only if that action was legal for the opponent
+    real = legal_b.gather(1, rep)
+    worst = my_val.masked_fill(~real, 1e9).min(dim=1).values          # [B*k]
+
+    # if my move already ended the game there is no reply to minimise over
+    settled = torch.where(kids.winner == me_k, torch.ones_like(worst),
+                          torch.where(kids.winner < 0, torch.zeros_like(worst),
+                                      -torch.ones_like(worst)))
+    q2 = torch.where(kids.done, settled, worst).view(B, k)
+
+    q = q.scatter(1, sel, q2).masked_fill(~legal, -1e9)
+    pi = torch.softmax(q / tau, dim=1) * legal
+    pi = pi / pi.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    return q, pi, legal
+
+
+def cmd_target_entropy(args):
+    """How much information does the policy target actually carry?
+
+    Cross-entropy cannot go below the target's own entropy, so a target close to
+    uniform means training on it is nearly a no-op no matter how long it runs.
+    This is the measurement that explained why the connect-4 recipe did not
+    transfer, and it is cheap enough that it should precede any long run.
+    """
+    import torch
+    device = args.device if args.device != "auto" else (
+        "cuda" if torch.cuda.is_available() else "cpu")
+    net, shape = load_aznet(args.net, device)
+    torch.manual_seed(args.seed)
+    t = TensorUTTT(args.games, device)
+    random_openings(t, args.open_plies)
+    print(f"{args.net} (trunk {shape[1]}-{shape[2]}), {args.games} positions after "
+          f"{args.open_plies} random plies")
+    for depth in (1, 2):
+        for tau in (0.5, 0.2):
+            _, pi, legal = improved_policy(t, net, tau=tau, depth=depth,
+                                           topk=args.topk)
+            H = float(-(pi.clamp_min(1e-12).log() * pi).sum(1).mean())
+            nl = float(legal.float().sum(1).mean())
+            unif = float(torch.log(torch.tensor(nl)))
+            print(f"  depth {depth}  tau {tau}:  target entropy {H:.4f}   "
+                  f"uniform over {nl:.1f} legal = {unif:.4f}   "
+                  f"information {unif - H:+.4f} nats")
+    return 0
 
 
 def _sym_perms(device):
@@ -1252,7 +1357,8 @@ def cmd_train_gpu(args):
     for it in range(1, args.iters + 1):
         for _ in range(args.steps_per_iter):
             x = t.encode()
-            _, pi, legal = improved_policy(t, net, tau=args.tau)
+            _, pi, legal = improved_policy(t, net, tau=args.tau,
+                                            depth=args.depth, topk=args.topk)
             # Exploration belongs in the opening. Sampling every ply (plus a
             # uniform mix) makes outcomes nearly unpredictable, and then the
             # value head is being asked to regress noise -- which is exactly
@@ -3152,6 +3258,8 @@ def main():
     tg.add_argument("--buffer", type=int, default=600000)
     tg.add_argument("--lr", type=float, default=1e-3)
     tg.add_argument("--tau", type=float, default=0.5)
+    tg.add_argument("--depth", type=int, default=1, choices=(1, 2))
+    tg.add_argument("--topk", type=int, default=8)
     tg.add_argument("--eps", type=float, default=0.08)
     tg.add_argument("--opening-plies", type=int, default=12)
     tg.add_argument("--value-weight", type=float, default=1.0)
@@ -3167,6 +3275,13 @@ def main():
     up = sub.add_parser("unpack-az")
     up.add_argument("--cpp", default="out/az_feat.cpp")
     up.add_argument("--out", default="out/deployed.pt")
+    te = sub.add_parser("target-entropy")
+    te.add_argument("--net", default="out/deployed.pt")
+    te.add_argument("--games", type=int, default=1024)
+    te.add_argument("--open-plies", type=int, default=8)
+    te.add_argument("--topk", type=int, default=8)
+    te.add_argument("--device", default="auto")
+    te.add_argument("--seed", type=int, default=0)
     en = sub.add_parser("eval-net")
     en.add_argument("--net", default="out/gpunet.pt")
     en.add_argument("--vs-net", default=None,
@@ -3235,6 +3350,8 @@ def main():
         sys.exit(cmd_pack(args))
     if args.cmd == "train-gpu":
         sys.exit(cmd_train_gpu(args))
+    if args.cmd == "target-entropy":
+        sys.exit(cmd_target_entropy(args))
     if args.cmd == "unpack-az":
         sys.exit(cmd_unpack_az(args))
     if args.cmd == "eval-net":
