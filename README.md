@@ -348,6 +348,41 @@ plateau that three arrangements of the DQN net all hit. Early signal at 8,080 ga
 **0.550 vs `greedy`**, already above the DQN net's 0.505 and above anything the Python
 AlphaZero loop reached.
 
+### Two self-play improvements, and what each was worth
+
+**1. Exploration belongs in the opening, not on every ply.** The first GPU run mixed 15%
+uniform noise into a temperature-sampled policy at *every* move. With play that noisy the
+game's outcome is close to unpredictable from any given position, so the value head was
+being asked to regress noise — which is precisely what a value loss frozen near 0.88 looks
+like. Confining exploration to the first 12 plies and playing near-greedy afterwards:
+
+| vs `greedy` | previous run | with schedule + augmentation |
+|---|---|---|
+| at iteration 40 | 0.367 | **0.817** |
+| at iteration 120 | 0.633 | **0.833** |
+
+**2. Eight-fold symmetry augmentation — free data.** Ultimate Tic-Tac-Toe is symmetric
+under the 8 dihedral transforms, but *only* if the transform is applied to the master board
+**and identically to every small board**; otherwise the "your move chooses my board" rule
+breaks and the augmented samples are mislabelled. That property is asserted, not assumed.
+Then a subtler trap: tensor indexing `x[:, :, perm]` *gathers*, so it applies the
+permutation's inverse. That is still a valid symmetry and features and policy receive the
+same map, but the way to know is to check, so `selfcheck` replays real games through each
+of the 8 maps and asserts `augment`'s output equals the engine's own encoding of the
+symmetric position with the policy target still aligned. All 8 pass.
+
+**Byte headroom, measured by packing real nets rather than estimated:**
+
+| trunk | weights | packed size |
+|---|---|---|
+| 324-128-96 (current) | 61,632 | 88,625 |
+| 324-144-96 | 68,352 | **97,289 — fits, 2.7KB spare** |
+| 324-152-96 | 71,712 | 101,609 — **over the cap** |
+
+So 144 is the widest trunk this budget allows. Capacity is the one lever still untested:
+int8 precision was shown not to cost strength, and depth was shown not to help, so
+"is 61,632 weights enough?" remains genuinely open.
+
 ### Where the compute actually goes (measured 2026-08-19)
 
 The obvious response to "the value head needs more training" is to rent a GPU. Measured,
