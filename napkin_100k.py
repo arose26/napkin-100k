@@ -869,25 +869,49 @@ def cmd_bench_search(args):
 # thousands of games advance per kernel launch and the accelerator does the work.
 # It is checked against the reference engine move-for-move (`gpu-parity`).
 
+_TABLE_CACHE = {}
+
+
+def _popcount_t(x):
+    """Popcount for 9-bit masks as tensor ops (torch has no popcount)."""
+    n = x - x
+    for b in range(9):
+        n = n + ((x >> b) & 1)
+    return n
+
+
 def _tables(device):
-    """Precomputed constants: cell->board, cell->bit, and 3-in-a-row lookup."""
+    """cell->board, cell->bit, win / threat / popcount lookups.
+
+    CACHED PER DEVICE and built with tensor ops. Every TensorUTTT constructs
+    these, and clone_repeat builds one per step, so the original Python loop over
+    512x512 pairs cost ~15 s per step -- hundreds of times the cost of the
+    self-play it was serving.
+    """
     import torch
+    key = str(device)
+    hit = _TABLE_CACHE.get(key)
+    if hit is not None:
+        return hit
+
     c2b = torch.tensor([(r // 3) * 3 + c // 3 for r in range(9) for c in range(9)],
                        dtype=torch.long, device=device)
     c2i = torch.tensor([(r % 3) * 3 + (c % 3) for r in range(9) for c in range(9)],
                        dtype=torch.long, device=device)
-    win = torch.zeros(512, dtype=torch.bool, device=device)
-    for m in range(512):
-        win[m] = any((m & w) == w for w in WIN_MASKS)
-    # threats[mine][block] and popcount, so the derived features are table
-    # lookups rather than arithmetic that could drift from the reference
-    thr = torch.zeros(512, 512, dtype=torch.int8, device=device)
-    for m in range(512):
-        for b in range(512):
-            thr[m, b] = _line_threats(m, b)
-    popc = torch.tensor([bin(i).count("1") for i in range(512)],
-                        dtype=torch.int8, device=device)
-    return c2b, c2i, win, thr, popc
+
+    masks = torch.arange(512, device=device)
+    lines = torch.tensor(WIN_MASKS, dtype=torch.long, device=device)   # [8]
+    inter = masks.unsqueeze(1) & lines.unsqueeze(0)                    # [512,8]
+    win = (inter == lines.unsqueeze(0)).any(dim=1)
+    two = _popcount_t(inter) == 2                                      # [512,8]
+    clear = inter == 0                                                 # [512,8]
+    # thr[m][b] = number of lines where m holds exactly 2 and b holds none
+    thr = (two.unsqueeze(1) & clear.unsqueeze(0)).sum(dim=2).to(torch.int8)
+    popc = _popcount_t(masks).to(torch.int8)
+
+    out = (c2b, c2i, win, thr, popc)
+    _TABLE_CACHE[key] = out
+    return out
 
 
 class TensorUTTT:
