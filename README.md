@@ -348,6 +348,34 @@ plateau that three arrangements of the DQN net all hit. Early signal at 8,080 ga
 **0.550 vs `greedy`**, already above the DQN net's 0.505 and above anything the Python
 AlphaZero loop reached.
 
+### H6 result — prediction NOT met, and the same ceiling for the third time
+
+209,850 self-play games at 96 games/s (~36 min), then packed and benchmarked on an idle
+machine: **30W–30L–0D of 60 vs `ab`, score 0.500** [0.377, 0.623]. The registered
+prediction was "> 0.50", so it is not met. Packed size 88,498 bytes; 10/10 forced wins.
+
+Three unrelated arrangements now land on the same number:
+
+| player | vs `ab` |
+|---|---|
+| DQN net + depth-3 negamax (Python) | 0.506 |
+| DQN net + iterative-deepening negamax (C++) | 0.467 |
+| **GPU-AlphaZero net + C++ search** | **0.500** |
+
+A ceiling that survives changing the training algorithm, the search implementation and the
+language is unlikely to be about any of those. **The value loss says what it is about:
+0.90 against a target variance of about 1.0** — the value head explains roughly a tenth of
+outcome variance, i.e. it is close to useless as an evaluator. A search whose leaf
+evaluation is near-constant degenerates to "exact near the end, guessing in the middle",
+which is a decent description of a bot that goes exactly even with a hand-tuned eval.
+
+Note what the improvements did and did not move: the exploration schedule lifted
+**vs-greedy 0.367 → 0.833** and the policy loss to 1.95 (uniform would be ln 81 = 4.39),
+so the **policy** head is learning well. The **value** head never budged from ~0.90 in any
+run. Policy and value are trained through a shared trunk with equal loss weights, and the
+policy term is roughly twice the size, so the value head may simply be losing the
+gradient competition — which is a testable claim, not a story.
+
 ### Two self-play improvements, and what each was worth
 
 **1. Exploration belongs in the opening, not on every ply.** The first GPU run mixed 15%
