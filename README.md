@@ -51,6 +51,15 @@ exactly 100,000 UTF-8 bytes**, and the whole architecture is sized backwards fro
     ----------
       ~75,000       weights affordable;  this net uses 68,224
 
+**The cap is platform-wide, not per-game.** Probed directly on seven arenas via the
+compile endpoint (which never touches a ladder): 100,000 bytes accepted, 100,001 rejected
+with the identical message, on **Ultimate Tic-Tac-Toe, Othello, Connect 4, Spring
+Challenge 2021, Yavalath, Breakthrough and Mad Pod Racing** (the flagship racing arena,
+formerly Coders Strike Back). The bytes-not-characters semantics travels too: a source of
+120,027 UTF-8 bytes but only 60,027 UTF-16 units was rejected on Othello exactly as on
+UTTT. So the budget arithmetic in this repo transfers unchanged to any CodinGame arena.
+
+
 Time does not bind. An int8 net of this class evaluates in **7.478 µs** inside the
 CodinGame sandbox (measured there, not extrapolated), so a 100 ms turn affords thousands
 of evaluations. AVX2 is available; the sandbox compiles at `-O0` unless the source asks
