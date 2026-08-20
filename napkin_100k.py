@@ -1209,7 +1209,20 @@ def cmd_train_gpu(args):
     device = args.device if args.device != "auto" else (
         "cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
-    net = build_aznet(device)
+    if getattr(args, "init", None):
+        # In connect-4, warm starting and halving the learning rate is what broke a
+        # plateau I had wrongly read as "more self-play buys nothing" -- it moved the
+        # value head for the first time and took the ladder from 92 to 34.
+        net, _shape = load_aznet(args.init, device)
+        net.train()
+        if list(_shape) != [N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT]:
+            raise ValueError(
+                f"{args.init} has shape {list(_shape)} but this build is "
+                f"{[N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT]}. Warm starting across a "
+                f"different feature layout would train on the wrong inputs.")
+        print(f"warm start from {args.init} (trunk {_shape[1]}-{_shape[2]})", flush=True)
+    else:
+        net = build_aznet(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
 
     B = args.batch_games
@@ -1306,8 +1319,14 @@ def cmd_train_gpu(args):
             print(f"iter {it}/{args.iters} games {games_done} buf {filled} "
                   f"loss {float(loss):.4f} (p {float(loss_p):.4f} v {float(loss_v):.4f}) "
                   f"vs-greedy {wr:.3f} ({time.time()-t0:.0f}s)", flush=True)
-        torch.save({"state_dict": net.state_dict(),
-                    "shape": [N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT]}, args.out)
+        ck = {"state_dict": net.state_dict(),
+              "shape": [N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT], "iter": it,
+              "games": games_done}
+        torch.save(ck, args.out)
+        # past-self is the only yardstick with headroom, and it does not exist
+        # unless it was saved on the way past
+        if getattr(args, "snapshot_every", 0) and it % args.snapshot_every == 0:
+            torch.save(ck, f"{args.out.rsplit('.', 1)[0]}_it{it:05d}.pt")
     rate = games_done / max(1e-9, time.time() - t0)
     print(f"saved {args.out} after {games_done} self-play games "
           f"({rate:,.0f} games/s, {aznet_param_bytes()} weights)")
@@ -1348,6 +1367,204 @@ def evaluate_aznet_greedy(net, device, games, seed):
         elif eng.winner == -1:
             d += 1
     return (w + 0.5 * d) / max(1, n)
+
+
+def random_openings(t, k):
+    """Advance a batch by `k` uniformly-random legal plies, in PAIRS.
+
+    Ported from napkin-100k-connect4, where it replaced a benchmark that had
+    silently collapsed. Two deterministic players play ONE game per seat no
+    matter how large the batch, and jittering the opponent's tie-breaks did not
+    diversify at all -- 1024 games produced 5 distinct final positions, so a
+    "1.000" score meant "won 5 games". Randomising the POSITION leaves both
+    players at full strength.
+
+    Games 2i and 2i+1 get the same opening and opposite seats, so the result is a
+    paired comparison and seat advantage cancels exactly. Verified in the other
+    repo: an identical net against itself reads 0.5000 to four places.
+    """
+    import torch
+    for _ in range(k):
+        lg = t.legal_mask()[::2].float()
+        a = torch.multinomial(lg + 1e-9, 1).squeeze(1)
+        t.step(a.repeat_interleave(2))
+
+
+def _distinct(t):
+    """How many distinct final positions a batch actually produced. Printed beside
+    every score, because a benchmark that has quietly collapsed to a handful of
+    games looks exactly like a benchmark that works."""
+    import torch
+    both = torch.cat([t.boards[:, 0], t.boards[:, 1],
+                      t.owned, t.drawn.unsqueeze(1)], dim=1)
+    return len({tuple(r.tolist()) for r in both.cpu()})
+
+
+def _wilson(p, n):
+    import math
+    z = 1.96
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    hw = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return c - hw, c + hw
+
+
+def play_out(net, other, device, games, seed, open_plies=8, tau=0.3):
+    """Net vs `other` from random paired openings, both playing their best.
+    Returns (score, wins, draws, distinct_final_positions)."""
+    import torch
+    games -= games % 2
+    torch.manual_seed(seed)
+    t = TensorUTTT(games, device)
+    random_openings(t, open_plies)
+    seat = torch.arange(games, device=device) % 2
+    while not bool(t.done.all()):
+        _, pi, _ = improved_policy(t, net, tau=tau)
+        t.step(torch.where(t.side == seat, pi.argmax(dim=1), other(t)))
+    win = (t.winner == seat).float()
+    draw = (t.winner < 0).float()
+    return (float((win + 0.5 * draw).mean()), float(win.mean()),
+            float(draw.mean()), _distinct(t))
+
+
+def net_mover(other_net, tau=0.3):
+    def act(t):
+        _, pi, _ = improved_policy(t, other_net, tau=tau)
+        return pi.argmax(dim=1)
+    return act
+
+
+def cmd_eval_net(args):
+    """Measure a checkpoint against a past self or a scripted opponent.
+
+    This is the instrument the first run of this repo did NOT have, and its
+    absence is why the offline harness reported "level" while the ladder moved
+    1,708 -> 1,017: a single scripted opponent has no resolution at this
+    strength. In napkin-100k-connect4 the paired past-self version predicted a
+    real ladder gain (0.605 offline; the ladder then moved 92 -> 34) that the
+    scripted yardstick could not see at all (0.881 vs 0.883).
+
+    Always read the distinct-final-position count. Use --vs-net SELF as a null
+    control: anything other than ~0.500 means the pairing is biased.
+    """
+    import torch
+    device = args.device if args.device != "auto" else (
+        "cuda" if torch.cuda.is_available() else "cpu")
+    net, shape = load_aznet(args.net, device)
+    if args.vs_net:
+        ref, rshape = load_aznet(args.vs_net, device)
+        if rshape[0] != shape[0]:
+            raise ValueError(f"{args.vs_net} has {rshape[0]} inputs, "
+                             f"{args.net} has {shape[0]}: not comparable")
+        other, label = net_mover(ref), args.vs_net
+    else:
+        pol = POLICIES[args.vs](seed=args.seed, budget_ms=args.budget_ms)
+        eng = Engine(2)
+
+        def other(t):
+            """Scripted opponents are per-object CPU code, so mirror each live
+            game into the reference engine one at a time. Slow by construction;
+            it exists only as a smoke test."""
+            import numpy as np
+            acts = torch.zeros(t.B, dtype=torch.long, device=t.device)
+            legal = t.legal_mask().cpu().numpy()
+            b0 = t.boards[:, 0].cpu().numpy()
+            b1 = t.boards[:, 1].cpu().numpy()
+            ow = t.owned.cpu().numpy()
+            dr = t.drawn.cpu().numpy()
+            last = t.last.cpu().numpy()
+            mv = t.side.cpu().numpy()
+            for k in range(t.B):
+                if not legal[k].any():
+                    continue
+                eng.set_state((tuple(int(x) for x in b0[k]),
+                               tuple(int(x) for x in b1[k]),
+                               int(ow[k][0]), int(ow[k][1]), int(dr[k]),
+                               0, 0,
+                               None if last[k] < 0 else index_action(int(last[k])),
+                               int(mv[k]), False, -1))
+                eng._valid = {index_action(int(i))
+                              for i in np.nonzero(legal[k])[0]}
+                acts[k] = action_index(*pol.act(eng))
+            return acts
+        label = args.vs
+    sc, w, d, nd = play_out(net, other, device, args.games, args.seed,
+                            open_plies=args.open_plies)
+    n = args.games - args.games % 2
+    lo, hi = _wilson(sc, n)
+    print(f"{args.net} (trunk {shape[1]}-{shape[2]}) vs {label}: score {sc:.3f} "
+          f"(95% Wilson {lo:.3f}..{hi:.3f}), win {w:.3f} draw {d:.3f}, "
+          f"{n} games from {args.open_plies} random opening plies, "
+          f"{nd} distinct final positions")
+    return 0
+
+
+def cmd_unpack_az(args):
+    """Recover a checkpoint from an emitted C++ bot.
+
+    Checkpoints are gitignored (a committed .pt makes a diff binary), so the only
+    artifact that survives in version control is the emitted source -- and the
+    exact .pt behind the deployed bot was overwritten by later training. The
+    weights are still there, in base85, so read them back.
+
+    What this returns is the DEQUANTISED int8 net, which is not bit-identical to
+    the fp32 original but IS exactly what plays on the ladder. For "must a new net
+    beat the deployed one", that is the more correct baseline of the two.
+    """
+    import re
+    import numpy as np
+    import torch
+
+    src = open(args.cpp, encoding="utf-8").read()
+    dim = re.search(r"N_IN=(\d+), T1=(\d+), T2=(\d+), N_ACT=(\d+)", src)
+    n_in, t1, t2, n_act = (int(g) for g in dim.groups())
+    sc = re.search(r"S1=([-\d.e+]+)f, S2=([-\d.e+]+)f, SP=([-\d.e+]+)f, "
+                   r"SV=([-\d.e+]+)f", src)
+    s1, s2, sp, sv = (float(g) for g in sc.groups())
+    nw = int(re.search(r"static int8_t W\[(\d+)\]", src).group(1))
+    # the LAST chunk line ends with '";', not just '"' -- missing it silently
+    # truncates the payload, which is exactly the failure this check catches
+    w85 = "".join(re.findall(r'^\s*"([^"]*)"\s*;?\s*$', src, re.M))
+    blob = b85_decode(w85, nw)
+    if len(blob) != nw:
+        raise ValueError(f"decoded {len(blob)} bytes, header says {nw}")
+
+    def floats(name):
+        m = re.search(name + r"\[\]=\{([^}]*)\}", src)
+        return np.array([float(x.rstrip("f")) for x in m.group(1).split(",")],
+                        dtype=np.float32)
+
+    q = np.frombuffer(blob, dtype=np.int8).astype(np.float32)
+    off = 0
+    def take(shape):
+        nonlocal off
+        n = int(np.prod(shape))
+        out = q[off:off + n].reshape(shape)
+        off += n
+        return out
+    w1 = take((t1, n_in)) * s1
+    w2 = take((t2, t1)) * s2
+    wp = take((n_act, t2)) * sp
+    wv = take((1, t2)) * sv
+    assert off == nw, (off, nw)
+    bv = float(re.search(r"static const float BV=([-\d.e+]+)f", src).group(1))
+    sd = {
+        "t1.weight": torch.from_numpy(w1.copy()),
+        "t1.bias": torch.from_numpy(floats("B1")),
+        "t2.weight": torch.from_numpy(w2.copy()),
+        "t2.bias": torch.from_numpy(floats("B2")),
+        "ph.weight": torch.from_numpy(wp.copy()),
+        "ph.bias": torch.from_numpy(floats("BP")),
+        "vh.weight": torch.from_numpy(wv.copy()),
+        "vh.bias": torch.tensor([bv]),
+    }
+    net = build_aznet("cpu", t1=t1, t2=t2)
+    net.load_state_dict(sd)          # fails loudly on any shape disagreement
+    torch.save({"state_dict": sd, "shape": [n_in, t1, t2, n_act],
+                "recovered_from": args.cpp}, args.out)
+    print(f"recovered {args.cpp} -> {args.out}: trunk {n_in}-{t1}-{t2}, "
+          f"{nw} int8 weights, scales {s1:.3g}/{s2:.3g}/{sp:.3g}/{sv:.3g}")
+    return 0
 
 
 def cmd_gpu_parity(args):
@@ -1583,7 +1800,20 @@ def cmd_train_az(args):
     device = args.device if args.device != "auto" else (
         "cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
-    net = build_aznet(device)
+    if getattr(args, "init", None):
+        # In connect-4, warm starting and halving the learning rate is what broke a
+        # plateau I had wrongly read as "more self-play buys nothing" -- it moved the
+        # value head for the first time and took the ladder from 92 to 34.
+        net, _shape = load_aznet(args.init, device)
+        net.train()
+        if list(_shape) != [N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT]:
+            raise ValueError(
+                f"{args.init} has shape {list(_shape)} but this build is "
+                f"{[N_IN, AZ_TRUNK1, AZ_TRUNK2, N_ACT]}. Warm starting across a "
+                f"different feature layout would train on the wrong inputs.")
+        print(f"warm start from {args.init} (trunk {_shape[1]}-{_shape[2]})", flush=True)
+    else:
+        net = build_aznet(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
     buf = []
     t0 = time.time()
@@ -2930,7 +3160,23 @@ def main():
     tg.add_argument("--eval-games", type=int, default=30)
     tg.add_argument("--device", default="auto")
     tg.add_argument("--seed", type=int, default=0)
+    tg.add_argument("--init", default=None,
+                    help="warm start from a checkpoint instead of random init")
+    tg.add_argument("--snapshot-every", type=int, default=250)
     tg.add_argument("--out", default="out/gpunet.pt")
+    up = sub.add_parser("unpack-az")
+    up.add_argument("--cpp", default="out/az_feat.cpp")
+    up.add_argument("--out", default="out/deployed.pt")
+    en = sub.add_parser("eval-net")
+    en.add_argument("--net", default="out/gpunet.pt")
+    en.add_argument("--vs-net", default=None,
+                    help="a past-self checkpoint; overrides --vs")
+    en.add_argument("--vs", default="greedy", choices=POLICIES)
+    en.add_argument("--games", type=int, default=512)
+    en.add_argument("--open-plies", type=int, default=8)
+    en.add_argument("--budget-ms", type=int, default=30)
+    en.add_argument("--device", default="auto")
+    en.add_argument("--seed", type=int, default=0)
     gp = sub.add_parser("gpu-parity")
     gp.add_argument("--games", type=int, default=64)
     gp.add_argument("--seed", type=int, default=0)
@@ -2989,6 +3235,10 @@ def main():
         sys.exit(cmd_pack(args))
     if args.cmd == "train-gpu":
         sys.exit(cmd_train_gpu(args))
+    if args.cmd == "unpack-az":
+        sys.exit(cmd_unpack_az(args))
+    if args.cmd == "eval-net":
+        sys.exit(cmd_eval_net(args))
     if args.cmd == "gpu-parity":
         sys.exit(cmd_gpu_parity(args))
     if args.cmd == "train-az":
