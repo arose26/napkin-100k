@@ -10,6 +10,17 @@ bot engineers. The account is
 [Napkin100k](https://www.codingame.com/profile/22639068dad6ecdf6717bb383d739a954432057),
 disclosed in its profile bio. One account, arena ladders only, never timed contests.
 
+## Result so far
+
+A self-play-trained neural network, weights and all, inside a single **95,891-byte**
+source file: **rank 1,017 of 10,071** on CodinGame's Ultimate Tic-Tac-Toe arena —
+**Gold league, top 11%**, on a ladder whose summit is held by the scene's best bot
+engineers (zasmu 35.56, Daporan 34.62, MrSubZero 33.85; this net 20.44).
+
+66,752 int8 weights decoded from base85 at startup, evaluated by a hand-rolled forward
+pass, with the value head scoring search leaves and the policy head ordering moves. No
+libraries, no external data, trained by self-play on one laptop GPU.
+
 House rules, unchanged from series 1/2: **one file**; hypotheses registered in this
 README *before* results; ≥5–10 seeds with IQM and bootstrap CIs wherever variance
 exists; ties reported as ties; honest nulls welcome; selfchecks written as
@@ -356,10 +367,11 @@ the same account, replacing the previous bot:
 
 | | previous bot | derived-feature net |
 |---|---|---|
-| global rank | 1,708 / 10,071 | **1,345 / 10,071** |
-| ladder score | 15.6 | **17.46** |
+| global rank | 1,708 / 10,071 | **1,017 / 10,071** |
+| ladder score | 15.6 | **20.44** |
+| league | Gold | Gold (top 11%) |
 
-**363 places better**, and still climbing when this was written. So the offline result was
+**691 places better.** So the offline result was
 misleading, and the reason is instructive: `ab` is a *single* hand-tuned opponent, and
 being level with one opponent says little about a field of 10,071 that includes many real
 MCTS implementations. A benchmark with one opponent has almost no resolution — the ladder
