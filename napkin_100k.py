@@ -1301,20 +1301,29 @@ def cmd_gpu_parity(args):
 # value head 96->1 = 61,632 weights = ~77.0k base85 chars, leaving room for the
 # MCTS harness inside 100,000 bytes.
 
-AZ_TRUNK1, AZ_TRUNK2 = 128, 96
+# Trunk width is a budget decision, not a taste one: 144 is the widest that
+# still packs under 100,000 bytes with the search harness (measured, see README).
+import os as _os
+AZ_TRUNK1 = int(_os.environ.get("NAPKIN_TRUNK1", 128))
+AZ_TRUNK2 = int(_os.environ.get("NAPKIN_TRUNK2", 96))
 
 
-def build_aznet(device="cpu"):
+def build_aznet(device="cpu", t1=None, t2=None):
+    """Trunk widths default to the module constants but can be given explicitly,
+    which is what lets a checkpoint decide its own shape (see load_aznet)."""
     import torch
     import torch.nn as nn
+
+    t1 = AZ_TRUNK1 if t1 is None else t1
+    t2 = AZ_TRUNK2 if t2 is None else t2
 
     class _AZ(nn.Module):
         def __init__(self):
             super().__init__()
-            self.t1 = nn.Linear(N_IN, AZ_TRUNK1)
-            self.t2 = nn.Linear(AZ_TRUNK1, AZ_TRUNK2)
-            self.ph = nn.Linear(AZ_TRUNK2, N_ACT)
-            self.vh = nn.Linear(AZ_TRUNK2, 1)
+            self.t1 = nn.Linear(N_IN, t1)
+            self.t2 = nn.Linear(t1, t2)
+            self.ph = nn.Linear(t2, N_ACT)
+            self.vh = nn.Linear(t2, 1)
 
         def forward(self, x):
             h = torch.relu(self.t1(x))
@@ -1322,6 +1331,23 @@ def build_aznet(device="cpu"):
             return self.ph(h), torch.tanh(self.vh(h)).squeeze(-1)
 
     return _AZ().to(device)
+
+
+def load_aznet(path, device="cpu"):
+    """Build from the SHAPE STORED IN THE CHECKPOINT, never from the ambient
+    constants. Trunk width is env-configurable, so a net trained at one width
+    would otherwise fail to load (or worse, load into the wrong architecture)
+    whenever the environment differs from the run that produced it."""
+    import torch
+    ck = torch.load(path, map_location=device)
+    shape = ck.get("shape")
+    if not shape or len(shape) != 4:
+        raise ValueError(f"{path}: missing or malformed 'shape'")
+    _, t1, t2, _ = shape
+    net = build_aznet(device, t1=t1, t2=t2)
+    net.load_state_dict(ck["state_dict"])
+    net.eval()
+    return net, shape
 
 
 def aznet_param_bytes():
@@ -2546,6 +2572,25 @@ def cmd_selfcheck(args):
     assert all(t[4] is not None and len(t[4]) == N_ACT for t in nonterm), \
         "non-terminal transition is missing its next-state legal mask"
     assert all(len(t[0]) == N_IN for t in trs), "state width mismatch"
+
+    # Checkpoint/architecture compatibility: trunk width is configurable via the
+    # environment, so a checkpoint must carry its own shape and be loadable no
+    # matter what the ambient constants happen to be right now.
+    import tempfile as _tf
+    import os as _osx
+    for _t1, _t2 in ((AZ_TRUNK1, AZ_TRUNK2), (AZ_TRUNK1 + 16, AZ_TRUNK2)):
+        _n = build_aznet("cpu", t1=_t1, t2=_t2)
+        _fd, _pth = _tf.mkstemp(suffix=".pt")
+        _osx.close(_fd)
+        torch.save({"state_dict": _n.state_dict(),
+                    "shape": [N_IN, _t1, _t2, N_ACT]}, _pth)
+        _ln, _sh = load_aznet(_pth, "cpu")
+        assert _sh == [N_IN, _t1, _t2, N_ACT]
+        assert _ln.t1.out_features == _t1, "loader ignored the checkpoint shape"
+        _x = torch.zeros(1, N_IN)
+        _lg, _v = _ln(_x)
+        assert _lg.shape == (1, N_ACT) and _v.shape == (1,)
+        _osx.unlink(_pth)
 
     # Symmetry augmentation: replaying a game through a symmetry must produce
     # exactly the permuted position. If it does not, augmentation is feeding the
