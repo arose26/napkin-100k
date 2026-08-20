@@ -376,6 +376,43 @@ run. Policy and value are trained through a shared trunk with equal loss weights
 policy term is roughly twice the size, so the value head may simply be losing the
 gradient competition — which is a testable claim, not a story.
 
+### What the value head actually knows (measured 2026-08-20)
+
+The ~0.90 value loss could mean two very different things: a weak evaluator, or a target
+that is genuinely unpredictable in self-play between near-equal players. Bucketing squared
+error by game phase separates them, and the comparison that matters is **MSE against the
+target's own variance** — a constant predictor of zero scores exactly the variance.
+
+| phase | value MSE | target variance | variance explained |
+|---|---|---|---|
+| plies 0–10 | 0.961 | 0.954 | ~0% |
+| plies 10–20 | 0.966 | 0.954 | ~0% |
+| plies 20–30 | 0.963 | 0.954 | ~0% |
+| plies 30–45 | 0.929 | 0.953 | 2% |
+| plies 45+ | 0.767 | 0.930 | 18% |
+| **overall** | **0.916** | **0.949** | **3.5%** |
+
+So the value head is **barely better than a constant zero**, and only becomes slightly
+informative in the endgame where the position is nearly resolved anyway. That is the
+ceiling: a search whose leaf evaluation carries ~3% of the signal is, in the middlegame,
+searching with almost no evaluation at all — exact near terminals, guessing elsewhere.
+It explains why three different arrangements all drew level with a hand-tuned eval and why
+searching *deeper* did not help.
+
+It also rules out the remaining easy explanations. Value loss stayed at ~0.90 when the
+loss weight was raised 5x, and again at trunk width 144 (68,352 weights). Precision, depth,
+gradient weight and capacity have now each been tested and none of them is the constraint.
+What has *not* been tested is the input representation: the network is a flat MLP over raw
+cell occupancy, so it has to rediscover "three in a row" independently for nine small
+boards and the master board, from 324 binary inputs. That is the next experiment.
+
+**A methodology note, because it nearly produced a wrong answer.** The first run of this
+diagnostic reported MSE 1.66 — *worse* than predicting zero — which would have implied an
+inverted value head. It was an artefact: the diagnostic played greedily, so all 512 games
+in the batch were the same deterministic game, and it measured one trajectory replicated.
+The tell was `n` values landing on exact multiples of 1024 and a target variance of exactly
+0.000 in the last bucket. With sampling restored the numbers above are the real ones.
+
 ### Two self-play improvements, and what each was worth
 
 **1. Exploration belongs in the opening, not on every ply.** The first GPU run mixed 15%
