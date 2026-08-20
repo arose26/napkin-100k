@@ -1210,7 +1210,7 @@ def cmd_train_gpu(args):
     t0 = time.time()
     games_done = 0
     ar = torch.arange(B, device=device)
-    perms = _sym_perms(device)
+    perms, bperms = _sym_perms(device)
 
     for it in range(1, args.iters + 1):
         for _ in range(args.steps_per_iter):
@@ -1268,7 +1268,7 @@ def cmd_train_gpu(args):
             xb, pb = bf_x[idx], bf_p[idx]
             if args.augment:
                 g = int(torch.randint(0, 8, (1,)).item())
-                xb, pb = augment(xb, pb, perms[g])
+                xb, pb = augment(xb, pb, perms[g], bperms[g])
             logits, v = net(xb)
             loss_p = -(pb * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
             loss_v = F.mse_loss(v, bf_z[idx])
