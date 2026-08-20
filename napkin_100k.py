@@ -196,12 +196,27 @@ def index_action(i: int):
 
 
 def encode_planes(eng: Engine, perspective: int):
-    """Flat 4x81 int list, perspective player's view of a level-2 state:
-    plane 0 my marks, 1 opponent marks, 2 legal-move mask, 3 my-owned-board mask
-    minus opponent-owned (both broadcast over the 9 cells of each small board).
-    Deliberately minimal; napkin-selfplay owns the final input spec."""
+    """Feature vector for the player `perspective`, length N_IN.
+
+    First four planes of 81 are raw: my marks, their marks, legal moves, and the
+    per-board owner difference. The tail is DERIVED information the network would
+    otherwise have to rediscover from raw occupancy -- three-in-a-row threats for
+    each of the nine small boards and for the master board, which board is
+    active, and the board-count difference. Nothing here is knowledge the net
+    could not in principle learn; it is the same position expressed in terms the
+    game is actually about, which is what the measured value head was failing to
+    extract on its own.
+
+    Layout:
+      [0:81]    my marks              [81:162]  their marks
+      [162:243] legal moves           [243:324] owned difference per cell
+      [324:333] my threats per board  [333:342] their threats per board
+      [342:351] board drawn flags     [351:360] active-board one-hot
+      [360]     free-choice flag      [361:363] master threats (mine, theirs)
+      [363]     board-count difference
+    """
     me, opp = perspective, 1 - perspective
-    planes = [0] * (4 * 81)
+    planes = [0] * N_IN
     legal = eng.valid_actions() if eng.current_player == perspective else set()
     for r in range(9):
         for c in range(9):
@@ -212,6 +227,28 @@ def encode_planes(eng: Engine, perspective: int):
             planes[81 + i] = (eng.boards[opp][b] >> pos) & 1
             planes[162 + i] = 1 if (r, c) in legal else 0
             planes[243 + i] = ((eng.owned[me] >> b) & 1) - ((eng.owned[opp] >> b) & 1)
+
+    for b in range(9):
+        planes[324 + b] = _line_threats(eng.boards[me][b], eng.boards[opp][b]) / 4.0
+        planes[333 + b] = _line_threats(eng.boards[opp][b], eng.boards[me][b]) / 4.0
+        planes[342 + b] = (eng.drawn >> b) & 1
+
+    tb = -1
+    if eng.last is not None:
+        cand = (eng.last[0] % 3) * 3 + eng.last[1] % 3
+        if not eng._decided(cand):
+            tb = cand
+    if tb >= 0:
+        planes[351 + tb] = 1
+    else:
+        planes[360] = 1
+
+    blocked_me = eng.owned[opp] | eng.drawn
+    blocked_opp = eng.owned[me] | eng.drawn
+    planes[361] = _line_threats(eng.owned[me], blocked_me) / 4.0
+    planes[362] = _line_threats(eng.owned[opp], blocked_opp) / 4.0
+    planes[363] = (bin(eng.owned[me]).count("1")
+                   - bin(eng.owned[opp]).count("1")) / 9.0
     return planes
 
 
@@ -482,7 +519,7 @@ def cmd_bench(args):
 # returns, no double-Q), re-verified in-domain per house rule. Self-play with a
 # league of past selves, exactly as the series design doc registered.
 
-N_IN, N_H1, N_H2, N_ACT = 324, 128, 128, 81
+N_IN, N_H1, N_H2, N_ACT = 364, 128, 128, 81
 
 
 def build_net(device="cpu"):
@@ -842,7 +879,15 @@ def _tables(device):
     win = torch.zeros(512, dtype=torch.bool, device=device)
     for m in range(512):
         win[m] = any((m & w) == w for w in WIN_MASKS)
-    return c2b, c2i, win
+    # threats[mine][block] and popcount, so the derived features are table
+    # lookups rather than arithmetic that could drift from the reference
+    thr = torch.zeros(512, 512, dtype=torch.int8, device=device)
+    for m in range(512):
+        for b in range(512):
+            thr[m, b] = _line_threats(m, b)
+    popc = torch.tensor([bin(i).count("1") for i in range(512)],
+                        dtype=torch.int8, device=device)
+    return c2b, c2i, win, thr, popc
 
 
 class TensorUTTT:
@@ -863,7 +908,7 @@ class TensorUTTT:
         import torch
         self.B = batch
         self.device = device
-        self.c2b, self.c2i, self.WIN = _tables(device)
+        self.c2b, self.c2i, self.WIN, self.THR, self.POPC = _tables(device)
         z = lambda *s, dt=torch.int32: torch.zeros(*s, dtype=dt, device=device)
         self.boards = z(batch, 2, 9)
         self.owned = z(batch, 2)
@@ -908,7 +953,8 @@ class TensorUTTT:
         return legal & ~self.done.unsqueeze(1)
 
     def encode(self):
-        """[B,324] float32, matching encode_planes() for the side to move."""
+        """[B,N_IN] float32, identical to encode_planes() for the side to move.
+        `gpu-parity --check-encode` asserts that feature-for-feature."""
         import torch
         me, opp = self.side, 1 - self.side
         bm = self.boards[self.ar, me]                                 # [B,9]
@@ -920,7 +966,38 @@ class TensorUTTT:
         om = ((self.owned[self.ar, me].unsqueeze(1) >> bits) & 1).float()
         oo = ((self.owned[self.ar, opp].unsqueeze(1) >> bits) & 1).float()
         odiff = (om - oo)[:, self.c2b]                                # [B,81]
-        return torch.cat([mine, theirs, legal, odiff], dim=1)
+
+        # derived features (see encode_planes for the layout and the reason)
+        thr_me = self.THR[bm.long(), bo.long()].float() / 4.0         # [B,9]
+        thr_op = self.THR[bo.long(), bm.long()].float() / 4.0
+        drawn = ((self.drawn.unsqueeze(1) >> bits) & 1).float()       # [B,9]
+
+        dec = self.decided()
+        tb = torch.where(self.last >= 0,
+                         ((self.last // 9) % 3) * 3 + (self.last % 9) % 3,
+                         torch.full_like(self.last, -1))
+        tb_ok = tb >= 0
+        tb_dead = torch.zeros_like(tb_ok)
+        tb_dead[tb_ok] = dec[self.ar[tb_ok], tb[tb_ok]]
+        active = tb_ok & ~tb_dead                                    # [B]
+        act1h = torch.zeros(self.B, 9, device=self.device)
+        idx = self.ar[active]
+        if idx.numel():
+            act1h[idx, tb[active]] = 1.0
+        free = (~active).float().unsqueeze(1)                        # [B,1]
+
+        ow_me = self.owned[self.ar, me].long()
+        ow_op = self.owned[self.ar, opp].long()
+        mthr_me = (self.THR[ow_me, (ow_op | self.drawn.long())]
+                   .float() / 4.0).unsqueeze(1)
+        mthr_op = (self.THR[ow_op, (ow_me | self.drawn.long())]
+                   .float() / 4.0).unsqueeze(1)
+        cnt_me = self.POPC[ow_me].float()
+        cnt_op = self.POPC[ow_op].float()
+        diff = ((cnt_me - cnt_op) / 9.0).unsqueeze(1)
+
+        return torch.cat([mine, theirs, legal, odiff, thr_me, thr_op, drawn,
+                          act1h, free, mthr_me, mthr_op, diff], dim=1)
 
     # -- transition ----------------------------------------------------------
 
@@ -2009,7 +2086,14 @@ static inline void unmk(Pos&p,int cell,const Undo&u){
     p.side=1-p.side;p.b[p.side][b]&=(uint16_t)~(1<<i);
     p.own[0]=u.o0;p.own[1]=u.o1;p.drawn=u.dr;p.last=u.last;p.cnt[0]=u.c0;p.cnt[1]=u.c1;
 }
-static float feat[4*81];
+static int thr(uint16_t mine,uint16_t block){
+    int n=0;
+    for(int i=0;i<8;i++)
+        if(!(block&WINM[i])&&__builtin_popcount((unsigned)(mine&WINM[i]))==2) n++;
+    return n;
+}
+static float feat[N_IN];
+/* must match encode_planes() in napkin_100k.py feature for feature */
 static void encode(const Pos&p,const int* mv,int n){
     memset(feat,0,sizeof(feat));
     int me=p.side,opp=1-me;
@@ -2020,6 +2104,18 @@ static void encode(const Pos&p,const int* mv,int n){
         feat[243+idx]=(float)(((p.own[me]>>b)&1)-((p.own[opp]>>b)&1));
     }
     for(int k=0;k<n;k++) feat[162+mv[k]]=1.f;
+    for(int b=0;b<9;b++){
+        feat[324+b]=(float)thr(p.b[me][b],p.b[opp][b])/4.f;
+        feat[333+b]=(float)thr(p.b[opp][b],p.b[me][b])/4.f;
+        feat[342+b]=(float)((p.drawn>>b)&1);
+    }
+    int tb=-1;
+    if(p.last>=0){ int cb=((p.last/9)%%3)*3+(p.last%%9)%%3; if(!decided(p,cb)) tb=cb; }
+    if(tb>=0) feat[351+tb]=1.f; else feat[360]=1.f;
+    feat[361]=(float)thr(p.own[me],(uint16_t)(p.own[opp]|p.drawn))/4.f;
+    feat[362]=(float)thr(p.own[opp],(uint16_t)(p.own[me]|p.drawn))/4.f;
+    feat[363]=(float)(__builtin_popcount((unsigned)p.own[me])
+                     -__builtin_popcount((unsigned)p.own[opp]))/9.f;
 }
 
 static std::chrono::steady_clock::time_point deadline;
@@ -2113,6 +2209,11 @@ def cmd_pack_az(args):
     ck = torch.load(args.net, map_location="cpu")
     sd = ck["state_dict"]
     n_in, t1, t2, n_act = ck["shape"]
+    if n_in != N_IN:
+        raise ValueError(
+            f"{args.net} expects {n_in} inputs but this build's encoder emits "
+            f"{N_IN}. Packing it would feed the net a different feature layout "
+            f"than it trained on.")
     w1, b1 = sd["t1.weight"].numpy(), sd["t1.bias"].numpy()
     w2, b2 = sd["t2.weight"].numpy(), sd["t2.bias"].numpy()
     wp, bp = sd["ph.weight"].numpy(), sd["ph.bias"].numpy()
@@ -2522,8 +2623,34 @@ def cmd_selfcheck(args):
     e = Engine(2)
     e.play(4, 4)
     pl = encode_planes(e, 1)
-    assert len(pl) == 324 and pl[81 + action_index(4, 4)] == 1
+    assert len(pl) == N_IN and pl[81 + action_index(4, 4)] == 1
     assert sum(pl[162:243]) == 8  # 8 legal replies in the center board
+    # derived tail: centre board is the active one after a centre-cell move
+    assert pl[351 + 4] == 1 and pl[360] == 0, "active-board feature wrong"
+    assert pl[363] == 0.0, "board differential should be zero here"
+
+    # The derived features must agree with the engine state they summarise, at
+    # every position of a real game and from both perspectives.
+    rng2 = random.Random(31)
+    fired = 0
+    for _ in range(6):
+        e2 = Engine(2)
+        while not e2.game_over:
+            for who in (0, 1):
+                f = encode_planes(e2, who)
+                assert len(f) == N_IN
+                other = 1 - who
+                for b in range(9):
+                    exp = _line_threats(e2.boards[who][b], e2.boards[other][b]) / 4.0
+                    assert abs(f[324 + b] - exp) < 1e-9, f"board {b} threat mismatch"
+                    assert f[342 + b] == ((e2.drawn >> b) & 1)
+                    fired += f[324 + b] > 0
+                assert sum(f[351:360]) + f[360] == 1, "active-board encoding invalid"
+                exp_d = (bin(e2.owned[who]).count("1")
+                         - bin(e2.owned[other]).count("1")) / 9.0
+                assert abs(f[363] - exp_d) < 1e-9, "board differential mismatch"
+            e2.play(*rng2.choice(sorted(e2.valid_actions())))
+    assert fired > 0, "threat features never fired in six games"
     assert action_index(*index_action(80)) == 80
 
     # base85 round-trip: the packer's encoder and the C++ decoder must agree on
