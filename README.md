@@ -1,8 +1,13 @@
-# napkin-100k
+# napkin-100k-tictac
 
 Train a neural network by self-play on one laptop, squeeze it — weights and all — into a
 single source file under CodinGame's hard **100,000-byte** limit, and find out how much
 playing strength actually fits in 100KB of text.
+
+This repo is the **Ultimate Tic-Tac-Toe** instance of that question. The byte cap is
+platform-wide (verified on seven arenas, below), so the budget arithmetic and the
+toolchain — self-play on GPU, quantise, pack into one C++ file — carry over to any other
+CodinGame arena; only the environment changes. Hence the game in the name.
 
 The game is [Ultimate Tic-Tac-Toe](https://www.codingame.com/multiplayer/bot-programming/tic-tac-toe),
 a public arena with **10,070 ranked bots** whose top ranks are held by the scene's best

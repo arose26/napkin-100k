@@ -1677,7 +1677,7 @@ def evaluate_aznet(net, device, sims, games, seed):
 # hand-rolled forward pass. No libraries exist inside a CodinGame submission.
 
 NET_CPP_TEMPLATE = r"""/* napkin-100k: a self-play-trained net, weights and all, in one file.
- * Disclosed bot - github.com/arose26/napkin-100k, account Napkin100k.
+ * Disclosed bot - github.com/arose26/napkin-100k-tictac, account Napkin100k.
  * Net: %(shape)s, int8 weights decoded from base85 below.
  * CG compiles at -O0 by default, hence the pragma. */
 #pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
@@ -1792,7 +1792,7 @@ NET_SEARCH_CPP_TEMPLATE = r"""/* napkin-100k: a self-play-trained net, weights a
  * used as the evaluation function inside a negamax search.
  * Every learned quantity is the net's; the search adds lookahead and exact
  * terminal results, and contains no hand-written position evaluation.
- * Disclosed bot - github.com/arose26/napkin-100k, account Napkin100k.
+ * Disclosed bot - github.com/arose26/napkin-100k-tictac, account Napkin100k.
  * Net: %(shape)s, int8 weights decoded from base85 below. */
 #pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
 #include <cstdio>
@@ -2043,7 +2043,7 @@ def quantize_int8(w):
 AZ_SEARCH_CPP_TEMPLATE = r"""/* napkin-100k: a GPU-self-play-trained policy+value net, weights and all, in one
  * file, driving a negamax search. The value head scores leaves, the policy head
  * orders moves, terminals are exact. No hand-written position evaluation.
- * Disclosed bot - github.com/arose26/napkin-100k, account Napkin100k.
+ * Disclosed bot - github.com/arose26/napkin-100k-tictac, account Napkin100k.
  * Trunk %(shape)s, int8 weights decoded from base85 below. */
 #pragma GCC optimize("O3","unroll-loops","omit-frame-pointer","inline")
 #include <cstdio>
