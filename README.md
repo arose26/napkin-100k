@@ -348,6 +348,28 @@ plateau that three arrangements of the DQN net all hit. Early signal at 8,080 ga
 **0.550 vs `greedy`**, already above the DQN net's 0.505 and above anything the Python
 AlphaZero loop reached.
 
+### The ladder disagrees with the offline harness — and the ladder is the real test
+
+The derived-feature net measured **0.483 against `ab`**, statistically level with every
+earlier attempt, so the offline harness called it "no better". Submitted to the arena, on
+the same account, replacing the previous bot:
+
+| | previous bot | derived-feature net |
+|---|---|---|
+| global rank | 1,708 / 10,071 | **1,345 / 10,071** |
+| ladder score | 15.6 | **17.46** |
+
+**363 places better**, and still climbing when this was written. So the offline result was
+misleading, and the reason is instructive: `ab` is a *single* hand-tuned opponent, and
+being level with one opponent says little about a field of 10,071 that includes many real
+MCTS implementations. A benchmark with one opponent has almost no resolution — the ladder
+discriminates because it is diverse.
+
+The lesson for the rest of this project: **treat `ab` as a smoke test, not a metric.** It
+is useful for catching a bot that is broken, and nearly useless for ranking bots that
+work. The measurements worth trusting are the ladder, and offline results against a
+*population* of opponents rather than one.
+
 ### Derived features: the value head improved, the ceiling did not move
 
 Giving the network the game's own abstractions (per-board and master threats, active
