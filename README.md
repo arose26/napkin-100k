@@ -348,6 +348,38 @@ plateau that three arrangements of the DQN net all hit. Early signal at 8,080 ga
 **0.550 vs `greedy`**, already above the DQN net's 0.505 and above anything the Python
 AlphaZero loop reached.
 
+### Derived features: the value head improved, the ceiling did not move
+
+Giving the network the game's own abstractions (per-board and master threats, active
+board, drawn flags, board difference) is the first change that moved the value loss at all:
+
+| configuration | value loss | vs `greedy` | vs `ab` |
+|---|---|---|---|
+| raw 324 features | ~0.90 | 0.85–0.90 | 0.500 |
+| raw + 5x value weight | ~0.90 | 0.90–1.00 | — |
+| raw + trunk 144 (68,352 weights) | 0.871 | 1.000 | — |
+| **derived 364 features** | **0.826** | **1.000** | **0.483** [0.362, 0.607] |
+
+391,029 self-play games in 855 s. Packed to 95,891 bytes, 4,109 under the cap, 10/10
+forced wins. So the representation genuinely helped the evaluator, and the bot now beats
+`greedy` every single game — **but against `ab` it is still level.** That is the fourth
+distinct approach to land on the same number:
+
+| player | vs `ab` |
+|---|---|
+| DQN net + depth-3 negamax (Python) | 0.506 |
+| DQN net + iterative-deepening negamax (C++) | 0.467 |
+| GPU-AlphaZero net, raw features + C++ search | 0.500 |
+| GPU-AlphaZero net, derived features + C++ search | 0.483 |
+
+Every one of precision, search depth, loss weighting, capacity and input representation
+has now been tested. Four of them changed nothing; the last improved the value head
+measurably and still did not move the result. At this point the honest reading is not
+"the net is broken" but that **`ab` is a genuinely strong opponent and parity with it is
+where this class of net lands** — a ~60k-weight evaluator inside a shallow search is about
+as good as a well-tuned hand-written alpha-beta, and no better. Beating it looks like it
+needs a different order of training compute, not another knob.
+
 ### H6 result — prediction NOT met, and the same ceiling for the third time
 
 209,850 self-play games at 96 games/s (~36 min), then packed and benchmarked on an idle
