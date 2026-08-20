@@ -2568,6 +2568,37 @@ def cmd_selfcheck(args):
         assert _la == _lb, (f"symmetry {_g} does not preserve legal moves: "
                             f"{sorted(_la ^ _lb)}")
 
+    # Test `augment` itself, not just the permutation table. Tensor indexing
+    # x[:, :, perm] GATHERS, so it applies perm's INVERSE -- still a symmetry
+    # (the group is closed under inverse) and still consistent between features
+    # and policy, but the only way to be sure is to compare against a game
+    # actually replayed through that map.
+    import numpy as _np
+    import torch as _t
+    for _g in range(8):
+        _p = _perms[_g].tolist()
+        _inv = [0] * 81
+        for _i, _v in enumerate(_p):
+            _inv[_v] = _i
+        _rng = random.Random(200 + _g)
+        _a, _b = Engine(2), Engine(2)
+        for _ in range(12):
+            if _a.game_over or _b.game_over:
+                break
+            _mv = _rng.choice(sorted(_a.valid_actions()))
+            _a.play(*_mv)
+            _b.play(*index_action(_inv[action_index(*_mv)]))
+        _xa = _t.tensor([encode_planes(_a, _a.current_player)], dtype=_t.float32)
+        _pa = _t.zeros(1, N_ACT)
+        for _act in _a.valid_actions():
+            _pa[0, action_index(*_act)] = 1.0
+        _xg, _pg = augment(_xa, _pa, _perms[_g])
+        _xb = _t.tensor([encode_planes(_b, _b.current_player)], dtype=_t.float32)
+        assert _t.equal(_xg, _xb), f"augment({_g}) features != replayed position"
+        _legal_b = {action_index(*x) for x in _b.valid_actions()}
+        assert set(_t.nonzero(_pg[0]).flatten().tolist()) == _legal_b, \
+            f"augment({_g}) policy target misaligned with its own features"
+
     # GPU engine: a second implementation of the rules is only trustworthy if it
     # agrees with the verified one. Same discipline as blind_engine.py, but the
     # divergence here would be silent -- training data would just be wrong.
