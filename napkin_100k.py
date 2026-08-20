@@ -1026,9 +1026,17 @@ class TensorUTTT:
     # -- transition ----------------------------------------------------------
 
     def step(self, cells):
-        """Apply one move per live game. `cells` [B] long; ignored where done."""
+        """Apply one move per live game. `cells` [B] long.
+
+        Entries that are finished OR ILLEGAL are no-ops. The legality half matters:
+        callers that speculatively step a fixed number of candidates (improved_policy
+        with topk) will hand this an illegal cell whenever a position has fewer legal
+        moves than that, which is 18% of positions at topk=8. Without the guard those
+        rows set a bit in an occupied cell and the state silently corrupts.
+        """
         import torch
-        live = ~self.done
+        ok = self.legal_mask().gather(1, cells.unsqueeze(1)).squeeze(1)
+        live = (~self.done) & ok
         if not bool(live.any()):
             return
         b = self.c2b[cells]
@@ -1206,6 +1214,11 @@ def improved_policy(t, net, tau=1.0, depth=1, topk=8):
                                       -torch.ones_like(worst)))
     q2 = torch.where(kids.done, settled, worst).view(B, k)
 
+    # a position with fewer than k legal moves puts illegal actions in `sel`; those
+    # slots keep their original value rather than a garbage one that happens to be
+    # masked away later
+    sel_legal = legal.gather(1, sel)
+    q2 = torch.where(sel_legal, q2, q.gather(1, sel))
     q = q.scatter(1, sel, q2).masked_fill(~legal, -1e9)
     pi = torch.softmax(q / tau, dim=1) * legal
     pi = pi / pi.sum(dim=1, keepdim=True).clamp_min(1e-9)
@@ -3187,6 +3200,21 @@ def cmd_selfcheck(args):
             e.play(*_rng.choice(va))
     assert _offered == 0 or _taken == _offered, \
         f"MCTS declined a forced win ({_taken}/{_offered}) - check backup sign"
+
+    # the tensor engine must treat an illegal action as a no-op (improved_policy's
+    # topk path depends on it)
+    try:
+        import torch
+        dev = "cpu"
+        tt = TensorUTTT(4, dev)
+        tt.step(torch.zeros(4, dtype=torch.long, device=dev))     # legal: cell 0
+        snap = (tt.boards.clone(), tt.side.clone(), tt.last.clone())
+        tt.step(torch.zeros(4, dtype=torch.long, device=dev))     # now ILLEGAL: occupied
+        assert torch.equal(tt.boards, snap[0]), "illegal step mutated the board"
+        assert torch.equal(tt.side, snap[1]), "illegal step advanced the turn"
+        assert torch.equal(tt.last, snap[2]), "illegal step moved `last`"
+    except ImportError:
+        print("selfcheck: torch absent, skipped the illegal-step contract")
 
     print("selfcheck OK")
     return 0
